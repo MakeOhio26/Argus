@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use tracing::warn;
 
 use crate::error::Result;
@@ -27,14 +29,40 @@ pub struct MemorySystem {
     client: Box<dyn GeminiClient>,
     graph: SpatialGraph,
     frame_store: FrameStore,
+    graph_path: Option<PathBuf>,
 }
 
 impl MemorySystem {
-    pub fn new(client: Box<dyn GeminiClient>, frame_store: FrameStore) -> Self {
+    pub fn new(
+        client: Box<dyn GeminiClient>,
+        frame_store: FrameStore,
+        graph_path: Option<PathBuf>,
+    ) -> Self {
+        let graph = graph_path
+            .as_deref()
+            .filter(|p| p.exists())
+            .and_then(|p| match SpatialGraph::load(p) {
+                Ok(g) => {
+                    tracing::info!(
+                        "Loaded graph from {} ({} entities, {} relations)",
+                        p.display(),
+                        g.entity_count(),
+                        g.relation_count()
+                    );
+                    Some(g)
+                }
+                Err(e) => {
+                    warn!("Could not load graph from {}: {e}", p.display());
+                    None
+                }
+            })
+            .unwrap_or_else(SpatialGraph::new);
+
         MemorySystem {
             client,
-            graph: SpatialGraph::new(),
+            graph,
             frame_store,
+            graph_path,
         }
     }
 
@@ -83,6 +111,13 @@ impl MemorySystem {
                     "Skipping invalid relation {:?} --{}--> {:?}: {e}",
                     relation.subject, relation.relation, relation.object
                 );
+            }
+        }
+
+        // Step 6 — persist updated graph to disk (if a path was configured).
+        if let Some(path) = &self.graph_path {
+            if let Err(e) = self.graph.save(path) {
+                warn!("Failed to save graph to {}: {e}", path.display());
             }
         }
 
@@ -173,7 +208,7 @@ mod tests {
             .returning(|_, _| Ok(make_scene_analysis()));
 
         let store = FrameStore::new(dir.path(), 10).unwrap();
-        let mut memory = MemorySystem::new(Box::new(mock), store);
+        let mut memory = MemorySystem::new(Box::new(mock), store, None);
         memory.process_frame(make_frame("f1")).await.unwrap();
 
         assert_eq!(memory.query(|g| g.entity_count()), 2);
@@ -189,7 +224,7 @@ mod tests {
             .returning(|_, _| Ok(make_scene_analysis()));
 
         let store = FrameStore::new(dir.path(), 10).unwrap();
-        let mut memory = MemorySystem::new(Box::new(mock), store);
+        let mut memory = MemorySystem::new(Box::new(mock), store, None);
         memory.process_frame(make_frame("f1")).await.unwrap();
         memory.process_frame(make_frame("f2")).await.unwrap();
 
@@ -206,7 +241,7 @@ mod tests {
             .returning(|_, _| Ok(make_scene_analysis()));
 
         let store = FrameStore::new(dir.path(), 10).unwrap();
-        let mut memory = MemorySystem::new(Box::new(mock), store);
+        let mut memory = MemorySystem::new(Box::new(mock), store, None);
         memory.process_frame(make_frame("f1")).await.unwrap();
 
         let latest = memory.get_entity_latest_frame("coffee_cup").unwrap();
@@ -222,7 +257,7 @@ mod tests {
             .returning(|_, _| Err(ArgusError::GeminiApi { status: 429, body: "rate limited".into() }));
 
         let store = FrameStore::new(dir.path(), 10).unwrap();
-        let mut memory = MemorySystem::new(Box::new(mock), store);
+        let mut memory = MemorySystem::new(Box::new(mock), store, None);
         let result = memory.process_frame(make_frame("f1")).await;
         assert!(matches!(result, Err(ArgusError::GeminiApi { status: 429, .. })));
     }
@@ -251,7 +286,7 @@ mod tests {
             });
 
         let store = FrameStore::new(dir.path(), 10).unwrap();
-        let mut memory = MemorySystem::new(Box::new(mock), store);
+        let mut memory = MemorySystem::new(Box::new(mock), store, None);
         // Should succeed despite the invalid relation.
         memory.process_frame(make_frame("f1")).await.unwrap();
         assert_eq!(memory.query(|g| g.entity_count()), 1);

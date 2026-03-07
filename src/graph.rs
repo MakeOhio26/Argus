@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{ArgusError, Result};
 
@@ -8,7 +10,7 @@ use crate::error::{ArgusError, Result};
 ///
 /// Python analogy: a simple `@dataclass` with three fields.
 /// No temporal tracking here — the `FrameStore` handles all frame history.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityNode {
     pub label: String,    // unique identifier, e.g. "coffee_cup"
     pub category: String, // "object" | "person" | "furniture" | "vehicle" | "animal"
@@ -16,9 +18,22 @@ pub struct EntityNode {
 }
 
 /// A directed spatial relationship between two entities — one edge in the graph.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelationEdge {
     pub relation: String, // "on" | "near" | "above" | "below" | "holds" | "faces"
+}
+
+#[derive(Serialize, Deserialize)]
+struct GraphSnapshot {
+    entities: Vec<EntityNode>,
+    relations: Vec<SnapshotRelation>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotRelation {
+    subject: String,
+    relation: String,
+    object: String,
 }
 
 /// The spatial semantic graph.
@@ -157,6 +172,48 @@ impl SpatialGraph {
     /// Returns true if an entity with the given label exists in the graph.
     pub fn contains_entity(&self, label: &str) -> bool {
         self.label_to_node.contains_key(label)
+    }
+
+    /// Persist the graph to a JSON file at `path`.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let entities: Vec<EntityNode> = self
+            .graph
+            .node_indices()
+            .map(|idx| self.graph[idx].clone())
+            .collect();
+
+        let relations: Vec<SnapshotRelation> = self
+            .graph
+            .edge_indices()
+            .map(|eidx| {
+                let (src, dst) = self.graph.edge_endpoints(eidx).unwrap();
+                SnapshotRelation {
+                    subject: self.graph[src].label.clone(),
+                    relation: self.graph[eidx].relation.clone(),
+                    object: self.graph[dst].label.clone(),
+                }
+            })
+            .collect();
+
+        let json = serde_json::to_string_pretty(&GraphSnapshot { entities, relations })?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Load a graph from a JSON file previously written by [`SpatialGraph::save`].
+    pub fn load(path: &Path) -> Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        let snapshot: GraphSnapshot = serde_json::from_str(&json)?;
+        let mut graph = SpatialGraph::new();
+        for entity in snapshot.entities {
+            graph.upsert_entity(&entity.label, &entity.category, entity.confidence);
+        }
+        for rel in snapshot.relations {
+            if let Err(e) = graph.upsert_relation(&rel.subject, &rel.relation, &rel.object) {
+                tracing::warn!("Skipping relation on load: {e}");
+            }
+        }
+        Ok(graph)
     }
 }
 

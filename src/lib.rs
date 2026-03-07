@@ -14,7 +14,7 @@
 //! # async fn example() -> argus::error::Result<()> {
 //! let client = Box::new(ReqwestGeminiClient::new("your-api-key"));
 //! let store  = FrameStore::new("./argus_store", 10)?;
-//! let mut memory = MemorySystem::new(client, store);
+//! let mut memory = MemorySystem::new(client, store, Some(std::path::PathBuf::from("./argus_graph.json")));
 //!
 //! let frame = Frame::new("frame_001", vec![0xFF, 0xD8, 0xFF])?;
 //! memory.process_frame(frame).await?;

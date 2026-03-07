@@ -131,7 +131,7 @@ impl ReqwestGeminiClient {
         Self {
             api_key: api_key.into(),
             base_url: "https://generativelanguage.googleapis.com".into(),
-            model: "gemini-2.0-flash".into(),
+            model: "gemini-2.5-flash".into(),
             http: reqwest::Client::new(),
         }
     }

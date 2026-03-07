@@ -11,6 +11,7 @@ use argus::frame_store::FrameStore;
 use argus::gemini::ReqwestGeminiClient;
 use argus::memory::MemorySystem;
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -81,7 +82,7 @@ async fn run() -> Result<()> {
     let gemini_client = Box::new(ReqwestGeminiClient::new(api_key));
     let frame_store =
         FrameStore::new("./argus_store", 10).context("failed to create frame store")?;
-    let mut memory = MemorySystem::new(gemini_client, frame_store);
+    let mut memory = MemorySystem::new(gemini_client, frame_store, Some(PathBuf::from("./argus_graph.json")));
 
     // Live stream placeholder — TODO: forward to WebSocket.
     let live_task = tokio::spawn(async move {
