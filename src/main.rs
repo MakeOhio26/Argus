@@ -11,7 +11,6 @@ use argus::frame_store::FrameStore;
 use argus::gemini::ReqwestGeminiClient;
 use argus::memory::MemorySystem;
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -23,8 +22,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use camera::{
-    CAMERA_DEVICE, PIPELINE_STR, VLM_INTERVAL, build_pipeline, install_appsink_callbacks,
-    pipeline_appsink, shutdown_pipeline,
+    VLM_INTERVAL, build_pipeline, format_pipeline_error, install_appsink_callbacks,
+    pipeline_appsink, resolve_camera_config, shutdown_pipeline,
 };
 
 #[tokio::main]
@@ -43,20 +42,13 @@ async fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    let pipeline_str = std::env::var("ARGUS_PIPELINE").unwrap_or_else(|_| PIPELINE_STR.to_string());
-    let uses_v4l2 = pipeline_str.contains("v4l2src");
-
-    if uses_v4l2 && !Path::new(CAMERA_DEVICE).exists() {
-        error!(
-            "Camera device {CAMERA_DEVICE} was not found. Check the CSI camera, overlay, and V4L2 setup."
-        );
-        return Err(anyhow!("missing camera device at {CAMERA_DEVICE}"));
-    }
+    let camera_config = resolve_camera_config()?;
 
     // GStreamer must be initialized before creating any elements or pipelines.
     gst::init().context("failed to initialize GStreamer")?;
 
-    let pipeline = build_pipeline(&pipeline_str).context("failed to build camera pipeline")?;
+    let pipeline =
+        build_pipeline(&camera_config.pipeline_str).context("failed to build camera pipeline")?;
     let appsink = pipeline_appsink(&pipeline).context("failed to access appsink named `sink`")?;
 
     // Two fan-out channels:
@@ -129,20 +121,15 @@ async fn run() -> Result<()> {
     // Watch the GStreamer bus on a dedicated thread.
     let bus = pipeline.bus().context("pipeline did not expose a bus")?;
     let (pipeline_error_tx, mut pipeline_error_rx) = mpsc::channel::<String>(1);
+    let camera_backend = camera_config.backend;
     thread::spawn(move || {
         for message in bus.iter_timed(gst::ClockTime::NONE) {
             if let gst::MessageView::Error(err) = message.view() {
-                let source = err
-                    .src()
-                    .map(|src| src.path_string())
-                    .unwrap_or_else(|| "unknown".into());
-                let details = err
-                    .debug()
-                    .map(|d| d.to_string())
-                    .unwrap_or_else(|| "no debug details".to_string());
-                let formatted = format!(
-                    "GStreamer pipeline error from {source}: {} ({details})",
-                    err.error()
+                let formatted = format_pipeline_error(
+                    camera_backend,
+                    err.src().map(|src| src.path_string().to_string()),
+                    err.error().to_string(),
+                    err.debug().map(|debug| debug.to_string()),
                 );
                 let _ = pipeline_error_tx.blocking_send(formatted);
                 break;
@@ -153,7 +140,8 @@ async fn run() -> Result<()> {
     pipeline
         .set_state(gst::State::Playing)
         .context("failed to set the camera pipeline to Playing")?;
-    info!("Camera pipeline started: {pipeline_str}");
+    info!("Camera backend selected: {}", camera_config.backend.as_str());
+    info!("Camera pipeline started: {}", camera_config.pipeline_str);
 
     tokio::select! {
         result = tokio::signal::ctrl_c() => {
