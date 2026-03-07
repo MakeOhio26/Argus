@@ -1,7 +1,10 @@
 // This binary requires GStreamer 1.x development libraries on the system:
 // `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`, and
 // `gstreamer1.0-plugins-good` for the `v4l2src` and `jpegenc` elements.
+// On Raspberry Pi 5 systems using libcamera from `/usr/local`, the GStreamer
+// plugin path must include `/usr/local/lib/aarch64-linux-gnu/gstreamer-1.0`.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,17 +13,106 @@ use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gst::prelude::*;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-pub const CAMERA_DEVICE: &str = "/dev/video0";
-pub const PIPELINE_STR: &str = concat!(
-    "v4l2src device=/dev/video0 ! ",
-    "video/x-raw,width=1280,height=720,framerate=30/1 ! ",
+const DEFAULT_V4L2_DEVICE: &str = "/dev/video0";
+const DEFAULT_GST_PLUGIN_PATH: &str = "/usr/local/lib/aarch64-linux-gnu/gstreamer-1.0";
+const LIBCAMERA_PIPELINE_STR: &str = concat!(
+    "libcamerasrc ! ",
+    "video/x-raw,colorimetry=bt709,format=NV12,width=1280,height=720,framerate=30/1 ! ",
+    "queue leaky=downstream max-size-buffers=2 ! ",
     "videoconvert ! ",
     "jpegenc quality=75 ! ",
     "appsink name=sink emit-signals=true sync=false drop=true max-buffers=2"
 );
 pub const VLM_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CameraBackend {
+    Libcamera,
+    V4l2,
+}
+
+impl CameraBackend {
+    fn from_env() -> Result<Self> {
+        match std::env::var("ARGUS_CAMERA_BACKEND")
+            .unwrap_or_else(|_| "libcamera".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "libcamera" => Ok(Self::Libcamera),
+            "v4l2" => Ok(Self::V4l2),
+            other => Err(anyhow!(
+                "unsupported ARGUS_CAMERA_BACKEND `{other}`; expected `libcamera` or `v4l2`"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Libcamera => "libcamera",
+            Self::V4l2 => "v4l2",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct CameraConfig {
+    pub backend: CameraBackend,
+    pub pipeline_str: String,
+}
+
+pub fn resolve_camera_config() -> Result<CameraConfig> {
+    configure_gstreamer_plugin_path();
+
+    if let Ok(pipeline_str) = std::env::var("ARGUS_PIPELINE") {
+        return Ok(CameraConfig {
+            backend: inferred_backend(&pipeline_str),
+            pipeline_str,
+        });
+    }
+
+    let backend = CameraBackend::from_env()?;
+    let pipeline_str = match backend {
+        CameraBackend::Libcamera => LIBCAMERA_PIPELINE_STR.to_string(),
+        CameraBackend::V4l2 => {
+            let device = std::env::var("ARGUS_V4L2_DEVICE")
+                .unwrap_or_else(|_| DEFAULT_V4L2_DEVICE.to_string());
+            validate_v4l2_device(&device)?;
+            build_v4l2_pipeline(&device)
+        }
+    };
+
+    Ok(CameraConfig {
+        backend,
+        pipeline_str,
+    })
+}
+
+pub fn format_pipeline_error(
+    backend: CameraBackend,
+    source: Option<String>,
+    error: String,
+    debug_details: Option<String>,
+) -> String {
+    let source = source.unwrap_or_else(|| "unknown".into());
+    let details = debug_details.unwrap_or_else(|| "no debug details".to_string());
+    let formatted = format!("GStreamer pipeline error from {source}: {error} ({details})");
+
+    if backend == CameraBackend::V4l2
+        && source.contains("v4l2src")
+        && (formatted.contains("Failed to allocate required memory")
+            || formatted.contains("reason not-negotiated")
+            || formatted.contains("Buffer pool activation failed"))
+    {
+        return format!(
+            "{formatted}. On Raspberry Pi 5, /dev/video0 is often an rp1-cfe raw frontend node. \
+Use ARGUS_CAMERA_BACKEND=libcamera or provide ARGUS_PIPELINE with libcamerasrc instead of raw v4l2src."
+        );
+    }
+
+    formatted
+}
 
 pub fn build_pipeline(pipeline_str: &str) -> Result<gst::Pipeline> {
     let element = gst::parse::launch(pipeline_str).context("unable to parse pipeline string")?;
@@ -103,6 +195,68 @@ pub async fn shutdown_pipeline(
     Ok(())
 }
 
+fn configure_gstreamer_plugin_path() {
+    let plugin_dir = Path::new(DEFAULT_GST_PLUGIN_PATH);
+    if !plugin_dir.exists() {
+        return;
+    }
+
+    let mut plugin_paths = std::env::var_os("GST_PLUGIN_PATH").unwrap_or_default();
+    let plugin_path_str = plugin_dir.as_os_str();
+
+    if plugin_paths.is_empty() {
+        plugin_paths.push(plugin_path_str);
+    } else {
+        let existing = std::env::split_paths(&plugin_paths).collect::<Vec<_>>();
+        if existing.iter().any(|path| path == plugin_dir) {
+            return;
+        }
+
+        let mut merged = existing;
+        merged.push(plugin_dir.to_path_buf());
+        if let Ok(joined) = std::env::join_paths(merged) {
+            plugin_paths = joined;
+        } else {
+            return;
+        }
+    }
+
+    // This happens during single-threaded startup before GStreamer is initialized.
+    unsafe {
+        std::env::set_var("GST_PLUGIN_PATH", plugin_paths);
+    }
+}
+
+fn inferred_backend(pipeline_str: &str) -> CameraBackend {
+    if pipeline_str.contains("v4l2src") {
+        CameraBackend::V4l2
+    } else {
+        CameraBackend::Libcamera
+    }
+}
+
+fn validate_v4l2_device(device: &str) -> Result<()> {
+    if !Path::new(device).exists() {
+        error!("Camera device {device} was not found. Check the CSI camera, overlay, and V4L2 setup.");
+        return Err(anyhow!("missing camera device at {device}"));
+    }
+
+    Ok(())
+}
+
+fn build_v4l2_pipeline(device: &str) -> String {
+    format!(
+        concat!(
+            "v4l2src device={device} ! ",
+            "video/x-raw,width=1280,height=720,framerate=30/1 ! ",
+            "videoconvert ! ",
+            "jpegenc quality=75 ! ",
+            "appsink name=sink emit-signals=true sync=false drop=true max-buffers=2"
+        ),
+        device = device
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +273,30 @@ mod tests {
     fn init_gstreamer() {
         static INIT: OnceLock<()> = OnceLock::new();
         INIT.get_or_init(|| gst::init().expect("failed to initialize GStreamer for tests"));
+    }
+
+    #[test]
+    fn default_backend_is_libcamera() {
+        assert_eq!(CameraBackend::from_env().unwrap(), CameraBackend::Libcamera);
+    }
+
+    #[test]
+    fn inferred_backend_detects_v4l2_pipeline() {
+        assert_eq!(
+            inferred_backend("v4l2src device=/dev/video0 ! appsink name=sink"),
+            CameraBackend::V4l2
+        );
+    }
+
+    #[test]
+    fn v4l2_error_is_rewritten_for_pi5_guidance() {
+        let message = format_pipeline_error(
+            CameraBackend::V4l2,
+            Some("/GstPipeline:pipeline0/GstV4l2Src:v4l2src0".into()),
+            "Failed to allocate required memory".into(),
+            Some("Buffer pool activation failed".into()),
+        );
+        assert!(message.contains("ARGUS_CAMERA_BACKEND=libcamera"));
     }
 
     #[tokio::test(flavor = "current_thread")]
