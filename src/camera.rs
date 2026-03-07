@@ -1,4 +1,4 @@
-// This binary requires GStreamer 1.x development libraries on the system:
+// This bin requires GStreamer 1.x development libraries on the system:
 // `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`, and
 // `gstreamer1.0-plugins-good` for the `v4l2src` and `jpegenc` elements.
 // On Raspberry Pi 5 systems using libcamera from `/usr/local`, the GStreamer
