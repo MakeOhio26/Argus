@@ -1,0 +1,231 @@
+use std::collections::HashMap;
+
+use petgraph::stable_graph::{NodeIndex, StableDiGraph};
+
+use crate::error::{ArgusError, Result};
+
+/// An entity observed in the scene — one node in the spatial graph.
+///
+/// Python analogy: a simple `@dataclass` with three fields.
+/// No temporal tracking here — the `FrameStore` handles all frame history.
+#[derive(Debug, Clone)]
+pub struct EntityNode {
+    pub label: String,    // unique identifier, e.g. "coffee_cup"
+    pub category: String, // "object" | "person" | "furniture" | "vehicle" | "animal"
+    pub confidence: f32,  // latest value from Gemini (0.0 – 1.0)
+}
+
+/// A directed spatial relationship between two entities — one edge in the graph.
+#[derive(Debug, Clone)]
+pub struct RelationEdge {
+    pub relation: String, // "on" | "near" | "above" | "below" | "holds" | "faces"
+}
+
+/// The spatial semantic graph.
+///
+/// Python analogy: `networkx.DiGraph` with attribute dicts on nodes and edges.
+///
+/// Uses `StableDiGraph` (not `DiGraph`) so that node indices remain valid even
+/// after other nodes are removed — this keeps `label_to_node` consistent.
+pub struct SpatialGraph {
+    graph: StableDiGraph<EntityNode, RelationEdge>,
+    /// Maps entity label → NodeIndex for O(1) lookup.
+    /// Python analogy: a `dict[str, node_id]`.
+    label_to_node: HashMap<String, NodeIndex>,
+}
+
+impl SpatialGraph {
+    pub fn new() -> Self {
+        SpatialGraph {
+            graph: StableDiGraph::new(),
+            label_to_node: HashMap::new(),
+        }
+    }
+
+    /// Insert or update an entity node.
+    ///
+    /// If an entity with this label already exists, its confidence is updated
+    /// to the latest value. If it's new, a node is inserted.
+    ///
+    /// Python analogy: `graph.nodes[label].update({"confidence": ...})`
+    /// or `graph.add_node(label, ...)` if new.
+    pub fn upsert_entity(&mut self, label: &str, category: &str, confidence: f32) {
+        if let Some(&idx) = self.label_to_node.get(label) {
+            self.graph[idx].confidence = confidence;
+        } else {
+            let idx = self.graph.add_node(EntityNode {
+                label: label.to_string(),
+                category: category.to_string(),
+                confidence,
+            });
+            self.label_to_node.insert(label.to_string(), idx);
+        }
+    }
+
+    /// Insert or update a directed edge: subject --[relation]--> object.
+    ///
+    /// Returns `Err(Graph)` if either entity label is not yet in the graph.
+    /// (The caller is responsible for upserting entities before relations.)
+    ///
+    /// Python analogy:
+    /// ```python
+    /// if graph.has_edge(subject, object):
+    ///     graph[subject][object]["relation"] = relation
+    /// else:
+    ///     graph.add_edge(subject, object, relation=relation)
+    /// ```
+    pub fn upsert_relation(&mut self, subject: &str, relation: &str, object: &str) -> Result<()> {
+        let subject_idx = self.label_to_node.get(subject).copied().ok_or_else(|| {
+            ArgusError::Graph(format!("unknown entity: {subject}"))
+        })?;
+        let object_idx = self.label_to_node.get(object).copied().ok_or_else(|| {
+            ArgusError::Graph(format!("unknown entity: {object}"))
+        })?;
+
+        if let Some(edge_idx) = self.graph.find_edge(subject_idx, object_idx) {
+            self.graph[edge_idx].relation = relation.to_string();
+        } else {
+            self.graph.add_edge(
+                subject_idx,
+                object_idx,
+                RelationEdge {
+                    relation: relation.to_string(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Serialize the current graph state into human-readable text for the Gemini prompt.
+    ///
+    /// Example output:
+    /// ```text
+    /// Entities in memory: coffee_cup (object, 0.95), desk (furniture, 0.98)
+    /// Relations: coffee_cup --on--> desk
+    /// ```
+    ///
+    /// An empty graph produces:
+    /// ```text
+    /// Entities in memory: (none)
+    /// Relations: (none)
+    /// ```
+    pub fn to_context_string(&self) -> String {
+        let entity_list: Vec<String> = self
+            .graph
+            .node_indices()
+            .map(|idx| {
+                let n = &self.graph[idx];
+                format!("{} ({}, {:.2})", n.label, n.category, n.confidence)
+            })
+            .collect();
+
+        let relation_list: Vec<String> = self
+            .graph
+            .edge_indices()
+            .map(|eidx| {
+                let (src, dst) = self.graph.edge_endpoints(eidx).unwrap();
+                let src_label = &self.graph[src].label;
+                let dst_label = &self.graph[dst].label;
+                let rel = &self.graph[eidx].relation;
+                format!("{src_label} --{rel}--> {dst_label}")
+            })
+            .collect();
+
+        let entities_str = if entity_list.is_empty() {
+            "(none)".to_string()
+        } else {
+            entity_list.join(", ")
+        };
+
+        let relations_str = if relation_list.is_empty() {
+            "(none)".to_string()
+        } else {
+            relation_list.join(", ")
+        };
+
+        format!("Entities in memory: {entities_str}\nRelations: {relations_str}")
+    }
+
+    pub fn entity_count(&self) -> usize {
+        self.graph.node_count()
+    }
+
+    pub fn relation_count(&self) -> usize {
+        self.graph.edge_count()
+    }
+
+    /// Returns true if an entity with the given label exists in the graph.
+    pub fn contains_entity(&self, label: &str) -> bool {
+        self.label_to_node.contains_key(label)
+    }
+}
+
+impl Default for SpatialGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_new_entity() {
+        let mut g = SpatialGraph::new();
+        g.upsert_entity("cup", "object", 0.9);
+        assert_eq!(g.entity_count(), 1);
+        assert!(g.contains_entity("cup"));
+    }
+
+    #[test]
+    fn upsert_same_entity_updates_confidence() {
+        let mut g = SpatialGraph::new();
+        g.upsert_entity("cup", "object", 0.8);
+        g.upsert_entity("cup", "object", 0.95);
+        // Still 1 node, confidence updated to latest
+        assert_eq!(g.entity_count(), 1);
+        let idx = g.label_to_node["cup"];
+        assert!((g.graph[idx].confidence - 0.95).abs() < 1e-5);
+    }
+
+    #[test]
+    fn upsert_relation_between_known_entities() {
+        let mut g = SpatialGraph::new();
+        g.upsert_entity("cup", "object", 0.9);
+        g.upsert_entity("desk", "furniture", 0.98);
+        g.upsert_relation("cup", "on", "desk").unwrap();
+        assert_eq!(g.relation_count(), 1);
+    }
+
+    #[test]
+    fn upsert_relation_unknown_entity_returns_error() {
+        let mut g = SpatialGraph::new();
+        g.upsert_entity("cup", "object", 0.9);
+        let result = g.upsert_relation("cup", "on", "ghost");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ArgusError::Graph(msg) => assert!(msg.contains("ghost")),
+            other => panic!("expected Graph error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_context_string_empty_graph() {
+        let g = SpatialGraph::new();
+        let ctx = g.to_context_string();
+        assert!(ctx.contains("(none)"));
+    }
+
+    #[test]
+    fn to_context_string_with_entities_and_relations() {
+        let mut g = SpatialGraph::new();
+        g.upsert_entity("cup", "object", 0.9);
+        g.upsert_entity("desk", "furniture", 0.95);
+        g.upsert_relation("cup", "on", "desk").unwrap();
+        let ctx = g.to_context_string();
+        assert!(ctx.contains("cup"));
+        assert!(ctx.contains("desk"));
+        assert!(ctx.contains("--on-->"));
+    }
+}

@@ -24,3 +24,9 @@ target
 # Added by cargo
 
 /target
+
+# Environment variables (never commit API keys)
+.env
+
+# Frame store (runtime data)
+/argus_store/
