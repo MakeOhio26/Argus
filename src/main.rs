@@ -301,14 +301,6 @@ async fn run() -> Result<()> {
     })
     .context("failed to install Ctrl+C handler")?;
 
-    let (shutdown_tx, _) = watch::channel(false);
-    let mut shutdown_signal_rx = shutdown_tx.subscribe();
-    let ctrlc_shutdown_tx = shutdown_tx.clone();
-    ctrlc::set_handler(move || {
-        let _ = ctrlc_shutdown_tx.send(true);
-    })
-    .context("failed to install Ctrl+C handler")?;
-
     // Rover serial client — optional, gated on ARGUS_ROVER_PORT env var.
     let rover_client: Arc<std::sync::Mutex<Option<DefaultRoverClient>>> =
         match std::env::var("ARGUS_ROVER_PORT") {
