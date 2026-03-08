@@ -51,7 +51,7 @@ async fn full_pipeline_entities_and_relations_in_graph() {
     let client = Box::new(
         ReqwestGeminiClient::new("fake-key").with_base_url(mock_server.uri()),
     );
-    let store = FrameStore::new(dir.path(), 10).unwrap();
+    let store = std::sync::Arc::new(FrameStore::new(dir.path(), 10).unwrap());
     let mut memory = MemorySystem::new(client, store, None);
 
     let frame = Frame::new("frame_1", tiny_jpeg()).unwrap();
@@ -76,7 +76,7 @@ async fn second_frame_with_same_entities_updates_confidence() {
     let client = Box::new(
         ReqwestGeminiClient::new("fake-key").with_base_url(mock_server.uri()),
     );
-    let store = FrameStore::new(dir.path(), 10).unwrap();
+    let store = std::sync::Arc::new(FrameStore::new(dir.path(), 10).unwrap());
     let mut memory = MemorySystem::new(client, store, None);
 
     memory.process_frame(Frame::new("frame_1", tiny_jpeg()).unwrap()).await.unwrap();
@@ -100,7 +100,7 @@ async fn frame_stored_and_retrievable_for_each_entity() {
     let client = Box::new(
         ReqwestGeminiClient::new("fake-key").with_base_url(mock_server.uri()),
     );
-    let store = FrameStore::new(dir.path(), 10).unwrap();
+    let store = std::sync::Arc::new(FrameStore::new(dir.path(), 10).unwrap());
     let mut memory = MemorySystem::new(client, store, None);
 
     memory.process_frame(Frame::new("frame_1", tiny_jpeg()).unwrap()).await.unwrap();
@@ -128,7 +128,7 @@ async fn duplicate_frames_not_stored_twice_for_entity() {
         ReqwestGeminiClient::new("fake-key").with_base_url(mock_server.uri()),
     );
     // max_frames=1 — only one novel frame per entity.
-    let store = FrameStore::new(dir.path(), 1).unwrap();
+    let store = std::sync::Arc::new(FrameStore::new(dir.path(), 1).unwrap());
     let mut memory = MemorySystem::new(client, store, None);
 
     let jpeg = tiny_jpeg();

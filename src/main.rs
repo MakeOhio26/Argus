@@ -49,6 +49,7 @@ async fn serve_ws_client(
     mut frame_rx: broadcast::Receiver<Vec<u8>>,
     mut graph_rx: broadcast::Receiver<String>,
     initial_graph: Arc<RwLock<String>>,
+    frame_store: Arc<FrameStore>,
 ) -> Result<()> {
     use futures_util::StreamExt;
 
@@ -93,6 +94,41 @@ async fn serve_ws_client(
                                 let cell = initial_graph.read().await;
                                 if !cell.is_empty() {
                                     sink.send(Message::Text(cell.clone().into())).await?;
+                                }
+                            }
+                            Ok(v) if v["type"] == "get_entity_images" => {
+                                let entity = v["entity"].as_str().unwrap_or("").to_string();
+                                if entity.is_empty() {
+                                    let _ = sink.send(Message::Text(
+                                        r#"{"type":"error","message":"missing entity field"}"#.into()
+                                    )).await;
+                                } else {
+                                    let store = Arc::clone(&frame_store);
+                                    let entity_key = entity.clone();
+                                    let result = tokio::task::spawn_blocking(move || {
+                                        store.load_all(&entity_key)
+                                    }).await;
+                                    match result {
+                                        Ok(Ok(images)) => {
+                                            use base64::{Engine, engine::general_purpose::STANDARD};
+                                            let encoded: Vec<String> = images.iter()
+                                                .map(|b| STANDARD.encode(b))
+                                                .collect();
+                                            let response = serde_json::json!({
+                                                "type": "entity_images",
+                                                "entity": entity,
+                                                "images": encoded,
+                                            });
+                                            if let Ok(json) = serde_json::to_string(&response) {
+                                                let _ = sink.send(Message::Text(json.into())).await;
+                                            }
+                                        }
+                                        _ => {
+                                            let _ = sink.send(Message::Text(
+                                                r#"{"type":"error","message":"failed to load entity images"}"#.into()
+                                            )).await;
+                                        }
+                                    }
                                 }
                             }
                             Ok(_) => {
@@ -162,8 +198,8 @@ async fn run() -> Result<()> {
         Box::new(ReqwestGeminiClient::new(api_key))
     };
     let frame_store =
-        FrameStore::new("./argus_store", 10).context("failed to create frame store")?;
-    let mut memory = MemorySystem::new(gemini_client, frame_store, Some(PathBuf::from("./argus_graph.json")));
+        Arc::new(FrameStore::new("./argus_store", 10).context("failed to create frame store")?);
+    let mut memory = MemorySystem::new(gemini_client, Arc::clone(&frame_store), Some(PathBuf::from("./argus_graph.json")));
 
     // WebSocket server — broadcasts live JPEG frames to connected clients.
     let ws_bind_addr = std::env::var("ARGUS_WS_BIND_ADDR")
@@ -178,6 +214,7 @@ async fn run() -> Result<()> {
     log_ws_listener(&ws_bind_addr, ws_port);
 
     let current_graph_listener = Arc::clone(&current_graph);
+    let frame_store_listener = Arc::clone(&frame_store);
     let live_task = tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -186,8 +223,9 @@ async fn run() -> Result<()> {
                     let frame_rx = live_stream_tx.subscribe();
                     let graph_rx = graph_tx.subscribe();
                     let initial = Arc::clone(&current_graph_listener);
+                    let store = Arc::clone(&frame_store_listener);
                     tokio::spawn(async move {
-                        if let Err(e) = serve_ws_client(stream, frame_rx, graph_rx, initial).await {
+                        if let Err(e) = serve_ws_client(stream, frame_rx, graph_rx, initial, store).await {
                             warn!("WebSocket client {addr} disconnected: {e}");
                         }
                     });

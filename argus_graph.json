@@ -1,31 +1,56 @@
 {
   "entities": [
     {
-      "label": "light_surface",
-      "category": "object",
-      "confidence": 0.95
+      "label": "person_1",
+      "category": "person",
+      "rank": 1,
+      "crossed_out": false
     },
     {
-      "label": "diagonal_dark_strip",
+      "label": "laptop",
       "category": "object",
-      "confidence": 0.9
+      "rank": 2,
+      "crossed_out": false
     },
     {
-      "label": "top_left_dark_fragment",
+      "label": "coffee_cup",
       "category": "object",
-      "confidence": 0.2
+      "rank": 3,
+      "crossed_out": false
+    },
+    {
+      "label": "desk",
+      "category": "furniture",
+      "rank": 4,
+      "crossed_out": true
+    },
+    {
+      "label": "backpack",
+      "category": "object",
+      "rank": 5,
+      "crossed_out": false
     }
   ],
   "relations": [
     {
-      "subject": "diagonal_dark_strip",
-      "relation": "on",
-      "object": "light_surface"
+      "subject": "person_1",
+      "relation": "uses",
+      "object": "laptop"
     },
     {
-      "subject": "top_left_dark_fragment",
+      "subject": "laptop",
       "relation": "on",
-      "object": "light_surface"
+      "object": "desk"
+    },
+    {
+      "subject": "coffee_cup",
+      "relation": "near",
+      "object": "laptop"
+    },
+    {
+      "subject": "person_1",
+      "relation": "holds",
+      "object": "backpack"
     }
   ]
 }

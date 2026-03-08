@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tracing::warn;
 
@@ -28,14 +29,14 @@ use crate::graph::SpatialGraph;
 pub struct MemorySystem {
     client: Box<dyn GeminiClient>,
     graph: SpatialGraph,
-    frame_store: FrameStore,
+    frame_store: Arc<FrameStore>,
     graph_path: Option<PathBuf>,
 }
 
 impl MemorySystem {
     pub fn new(
         client: Box<dyn GeminiClient>,
-        frame_store: FrameStore,
+        frame_store: Arc<FrameStore>,
         graph_path: Option<PathBuf>,
     ) -> Self {
         let graph = graph_path
@@ -204,7 +205,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(make_scene_analysis()));
 
-        let store = FrameStore::new(dir.path(), 10).unwrap();
+        let store = Arc::new(FrameStore::new(dir.path(), 10).unwrap());
         let mut memory = MemorySystem::new(Box::new(mock), store, None);
         memory.process_frame(make_frame("f1")).await.unwrap();
 
@@ -220,7 +221,7 @@ mod tests {
             .times(2)
             .returning(|_, _| Ok(make_scene_analysis()));
 
-        let store = FrameStore::new(dir.path(), 10).unwrap();
+        let store = Arc::new(FrameStore::new(dir.path(), 10).unwrap());
         let mut memory = MemorySystem::new(Box::new(mock), store, None);
         memory.process_frame(make_frame("f1")).await.unwrap();
         memory.process_frame(make_frame("f2")).await.unwrap();
@@ -237,7 +238,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(make_scene_analysis()));
 
-        let store = FrameStore::new(dir.path(), 10).unwrap();
+        let store = Arc::new(FrameStore::new(dir.path(), 10).unwrap());
         let mut memory = MemorySystem::new(Box::new(mock), store, None);
         memory.process_frame(make_frame("f1")).await.unwrap();
 
@@ -253,7 +254,7 @@ mod tests {
         mock.expect_analyze_frame()
             .returning(|_, _| Err(ArgusError::GeminiApi { status: 429, body: "rate limited".into() }));
 
-        let store = FrameStore::new(dir.path(), 10).unwrap();
+        let store = Arc::new(FrameStore::new(dir.path(), 10).unwrap());
         let mut memory = MemorySystem::new(Box::new(mock), store, None);
         let result = memory.process_frame(make_frame("f1")).await;
         assert!(matches!(result, Err(ArgusError::GeminiApi { status: 429, .. })));
@@ -281,7 +282,7 @@ mod tests {
                 })
             });
 
-        let store = FrameStore::new(dir.path(), 10).unwrap();
+        let store = Arc::new(FrameStore::new(dir.path(), 10).unwrap());
         let mut memory = MemorySystem::new(Box::new(mock), store, None);
         // Should succeed despite the invalid relation.
         memory.process_frame(make_frame("f1")).await.unwrap();
