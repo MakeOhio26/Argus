@@ -8,7 +8,7 @@ mod camera;
 // Memory modules come from the library crate (src/lib.rs).
 use argus::frame::Frame;
 use argus::frame_store::FrameStore;
-use argus::gemini::ReqwestGeminiClient;
+use argus::gemini::{ReqwestGeminiClient, StubGeminiClient};
 use argus::memory::MemorySystem;
 
 use std::path::PathBuf;
@@ -63,6 +63,7 @@ async fn serve_ws_client(
 }
 
 async fn run() -> Result<()> {
+    let stub_mode = std::env::args().any(|a| a == "--stub");
     let camera_config = resolve_camera_config()?;
 
     // GStreamer must be initialized before creating any elements or pipelines.
@@ -96,9 +97,14 @@ async fn run() -> Result<()> {
     // GEMINI_API_KEY can be set in a .env file or exported in the shell.
     // The FrameStore keeps up to 10 novel (perceptually distinct) frames
     // per observed entity on disk under ./argus_store/.
-    let api_key = std::env::var("GEMINI_API_KEY")
-        .context("GEMINI_API_KEY not set — add it to .env or export it")?;
-    let gemini_client = Box::new(ReqwestGeminiClient::new(api_key));
+    let gemini_client: Box<dyn argus::gemini::GeminiClient> = if stub_mode {
+        info!("--stub flag set: using StubGeminiClient (no real Gemini calls)");
+        Box::new(StubGeminiClient)
+    } else {
+        let api_key = std::env::var("GEMINI_API_KEY")
+            .context("GEMINI_API_KEY not set — add it to .env or export it")?;
+        Box::new(ReqwestGeminiClient::new(api_key))
+    };
     let frame_store =
         FrameStore::new("./argus_store", 10).context("failed to create frame store")?;
     let mut memory = MemorySystem::new(gemini_client, frame_store, Some(PathBuf::from("./argus_graph.json")));

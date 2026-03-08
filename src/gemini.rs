@@ -116,6 +116,25 @@ pub trait GeminiClient: Send + Sync {
     async fn analyze_frame(&self, frame: &Frame, graph_context: &str) -> Result<SceneAnalysis>;
 }
 
+// ── Stub implementation (for local testing without a real API key) ────────────
+
+/// A no-op [`GeminiClient`] that always returns an empty [`SceneAnalysis`].
+///
+/// Useful for testing the vision feed pipeline end-to-end without hitting the
+/// real Gemini API.  Swap this in for [`ReqwestGeminiClient`] in `main.rs`.
+pub struct StubGeminiClient;
+
+#[async_trait]
+impl GeminiClient for StubGeminiClient {
+    async fn analyze_frame(&self, _frame: &Frame, _graph_context: &str) -> Result<SceneAnalysis> {
+        Ok(SceneAnalysis {
+            entities: vec![],
+            relations: vec![],
+            raw_text: "(stub)".into(),
+        })
+    }
+}
+
 // ── Real reqwest-based implementation ────────────────────────────────────────
 
 pub struct ReqwestGeminiClient {
