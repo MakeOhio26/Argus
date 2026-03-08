@@ -17,14 +17,7 @@ use tracing::{debug, error, info, warn};
 
 const DEFAULT_V4L2_DEVICE: &str = "/dev/video0";
 const DEFAULT_GST_PLUGIN_PATH: &str = "/usr/local/lib/aarch64-linux-gnu/gstreamer-1.0";
-const LIBCAMERA_PIPELINE_STR: &str = concat!(
-    "libcamerasrc ! ",
-    "video/x-raw,colorimetry=bt709,format=NV12,width=1280,height=720,framerate=30/1 ! ",
-    "queue leaky=downstream max-size-buffers=2 ! ",
-    "videoconvert ! ",
-    "jpegenc quality=75 ! ",
-    "appsink name=sink emit-signals=true sync=false drop=true max-buffers=2"
-);
+const DEFAULT_CAMERA_ORIENTATION: &str = "rotate-180";
 pub const VLM_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +49,47 @@ impl CameraBackend {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CameraOrientation {
+    None,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+    HorizontalFlip,
+    VerticalFlip,
+}
+
+impl CameraOrientation {
+    fn from_env() -> Result<Self> {
+        match std::env::var("ARGUS_CAMERA_ORIENTATION")
+            .unwrap_or_else(|_| DEFAULT_CAMERA_ORIENTATION.to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "none" => Ok(Self::None),
+            "rotate-90" => Ok(Self::Rotate90),
+            "rotate-180" => Ok(Self::Rotate180),
+            "rotate-270" => Ok(Self::Rotate270),
+            "hflip" => Ok(Self::HorizontalFlip),
+            "vflip" => Ok(Self::VerticalFlip),
+            other => Err(anyhow!(
+                "unsupported ARGUS_CAMERA_ORIENTATION `{other}`; expected none, rotate-90, rotate-180, rotate-270, hflip, or vflip"
+            )),
+        }
+    }
+
+    fn as_gst_method(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Rotate90 => Some("clockwise"),
+            Self::Rotate180 => Some("rotate-180"),
+            Self::Rotate270 => Some("counterclockwise"),
+            Self::HorizontalFlip => Some("horizontal-flip"),
+            Self::VerticalFlip => Some("vertical-flip"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CameraConfig {
     pub backend: CameraBackend,
@@ -73,13 +107,14 @@ pub fn resolve_camera_config() -> Result<CameraConfig> {
     }
 
     let backend = CameraBackend::from_env()?;
+    let orientation = CameraOrientation::from_env()?;
     let pipeline_str = match backend {
-        CameraBackend::Libcamera => LIBCAMERA_PIPELINE_STR.to_string(),
+        CameraBackend::Libcamera => build_libcamera_pipeline(orientation),
         CameraBackend::V4l2 => {
             let device = std::env::var("ARGUS_V4L2_DEVICE")
                 .unwrap_or_else(|_| DEFAULT_V4L2_DEVICE.to_string());
             validate_v4l2_device(&device)?;
-            build_v4l2_pipeline(&device)
+            build_v4l2_pipeline(&device, orientation)
         }
     };
 
@@ -243,23 +278,54 @@ fn validate_v4l2_device(device: &str) -> Result<()> {
     Ok(())
 }
 
-fn build_v4l2_pipeline(device: &str) -> String {
+fn build_libcamera_pipeline(orientation: CameraOrientation) -> String {
+    format!(
+        concat!(
+            "libcamerasrc ! ",
+            "video/x-raw,colorimetry=bt709,format=NV12,width=1280,height=720,framerate=30/1 ! ",
+            "queue leaky=downstream max-size-buffers=2 ! ",
+            "videoconvert ! ",
+            "{orientation}",
+            "jpegenc quality=75 ! ",
+            "appsink name=sink emit-signals=true sync=false drop=true max-buffers=2"
+        ),
+        orientation = videoflip_segment(orientation)
+    )
+}
+
+fn build_v4l2_pipeline(device: &str, orientation: CameraOrientation) -> String {
     format!(
         concat!(
             "v4l2src device={device} ! ",
             "video/x-raw,width=1280,height=720,framerate=30/1 ! ",
             "videoconvert ! ",
+            "{orientation}",
             "jpegenc quality=75 ! ",
             "appsink name=sink emit-signals=true sync=false drop=true max-buffers=2"
         ),
-        device = device
+        device = device,
+        orientation = videoflip_segment(orientation)
     )
+}
+
+fn videoflip_segment(orientation: CameraOrientation) -> &'static str {
+    match orientation.as_gst_method() {
+        Some(method) => match method {
+            "clockwise" => "videoflip method=clockwise ! ",
+            "rotate-180" => "videoflip method=rotate-180 ! ",
+            "counterclockwise" => "videoflip method=counterclockwise ! ",
+            "horizontal-flip" => "videoflip method=horizontal-flip ! ",
+            "vertical-flip" => "videoflip method=vertical-flip ! ",
+            _ => unreachable!("unsupported videoflip method"),
+        },
+        None => "",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::OnceLock;
+    use std::sync::{Mutex as StdMutex, OnceLock};
 
     const TEST_PIPELINE_STR: &str = concat!(
         "videotestsrc is-live=true pattern=ball ! ",
@@ -274,9 +340,56 @@ mod tests {
         INIT.get_or_init(|| gst::init().expect("failed to initialize GStreamer for tests"));
     }
 
+    fn env_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    fn with_env<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let previous: Vec<_> = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var_os(key)))
+            .collect();
+        for (key, value) in vars {
+            match value {
+                Some(value) => unsafe {
+                    std::env::set_var(key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(key);
+                },
+            }
+        }
+        let result = f();
+        for (key, value) in previous {
+            match value {
+                Some(value) => unsafe {
+                    std::env::set_var(&key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(&key);
+                },
+            }
+        }
+        result
+    }
+
     #[test]
     fn default_backend_is_libcamera() {
-        assert_eq!(CameraBackend::from_env().unwrap(), CameraBackend::Libcamera);
+        with_env(&[("ARGUS_CAMERA_BACKEND", None)], || {
+            assert_eq!(CameraBackend::from_env().unwrap(), CameraBackend::Libcamera);
+        });
+    }
+
+    #[test]
+    fn default_orientation_is_rotate_180() {
+        with_env(&[("ARGUS_CAMERA_ORIENTATION", None)], || {
+            assert_eq!(
+                CameraOrientation::from_env().unwrap(),
+                CameraOrientation::Rotate180
+            );
+        });
     }
 
     #[test]
@@ -296,6 +409,76 @@ mod tests {
             Some("Buffer pool activation failed".into()),
         );
         assert!(message.contains("ARGUS_CAMERA_BACKEND=libcamera"));
+    }
+
+    #[test]
+    fn libcamera_pipeline_includes_default_rotate_180() {
+        let pipeline = build_libcamera_pipeline(CameraOrientation::Rotate180);
+        assert!(pipeline.contains("videoflip method=rotate-180"));
+    }
+
+    #[test]
+    fn v4l2_pipeline_omits_videoflip_when_orientation_is_none() {
+        let pipeline = build_v4l2_pipeline("/dev/video0", CameraOrientation::None);
+        assert!(!pipeline.contains("videoflip method="));
+    }
+
+    #[test]
+    fn resolve_camera_config_uses_orientation_in_generated_pipeline() {
+        with_env(
+            &[
+                ("ARGUS_PIPELINE", None),
+                ("ARGUS_CAMERA_BACKEND", Some("libcamera")),
+                ("ARGUS_CAMERA_ORIENTATION", Some("rotate-270")),
+            ],
+            || {
+                let config = resolve_camera_config().expect("camera config should resolve");
+                assert_eq!(config.backend, CameraBackend::Libcamera);
+                assert!(config.pipeline_str.contains("videoflip method=counterclockwise"));
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_camera_config_applies_default_orientation() {
+        with_env(
+            &[
+                ("ARGUS_PIPELINE", None),
+                ("ARGUS_CAMERA_BACKEND", Some("libcamera")),
+                ("ARGUS_CAMERA_ORIENTATION", None),
+            ],
+            || {
+                let config = resolve_camera_config().expect("camera config should resolve");
+                assert!(config.pipeline_str.contains("videoflip method=rotate-180"));
+            },
+        );
+    }
+
+    #[test]
+    fn orientation_env_accepts_hflip() {
+        with_env(&[("ARGUS_CAMERA_ORIENTATION", Some("hflip"))], || {
+            assert_eq!(
+                CameraOrientation::from_env().expect("orientation should parse"),
+                CameraOrientation::HorizontalFlip
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_camera_config_preserves_custom_pipeline_override() {
+        with_env(
+            &[
+                (
+                    "ARGUS_PIPELINE",
+                    Some("videotestsrc ! jpegenc ! appsink name=sink"),
+                ),
+                ("ARGUS_CAMERA_ORIENTATION", Some("rotate-180")),
+            ],
+            || {
+                let config = resolve_camera_config().expect("camera config should resolve");
+                assert_eq!(config.pipeline_str, "videotestsrc ! jpegenc ! appsink name=sink");
+            },
+        )
     }
 
     #[tokio::test(flavor = "current_thread")]

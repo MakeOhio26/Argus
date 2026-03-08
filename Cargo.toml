@@ -30,6 +30,7 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 tokio-tungstenite = "0.26"
+ctrlc = "3"
 
 [dev-dependencies]
 wiremock = "0.6"
