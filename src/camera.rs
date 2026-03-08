@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gst::prelude::*;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 const DEFAULT_V4L2_DEVICE: &str = "/dev/video0";
@@ -131,12 +131,12 @@ pub fn pipeline_appsink(pipeline: &gst::Pipeline) -> Result<gst_app::AppSink> {
 
 pub fn install_appsink_callbacks(
     appsink: &gst_app::AppSink,
-    live_stream_tx: mpsc::Sender<Vec<u8>>,
+    live_stream_tx: broadcast::Sender<Vec<u8>>,
     vlm_tx: mpsc::Sender<Vec<u8>>,
     last_vlm_send: Arc<Mutex<Instant>>,
 ) {
     // The appsink callback runs on a GStreamer streaming thread, so it must stay
-    // synchronous and non-blocking. We only clone frame bytes and `try_send`.
+    // synchronous and non-blocking. We only clone frame bytes and send.
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -145,9 +145,8 @@ pub fn install_appsink_callbacks(
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                 let frame_bytes = map.as_slice().to_vec();
 
-                if live_stream_tx.try_send(frame_bytes.clone()).is_err() {
-                    debug!("Dropping live stream frame because the channel is full");
-                }
+                // Errors only if there are no receivers — fine to ignore.
+                let _ = live_stream_tx.send(frame_bytes.clone());
 
                 let should_send_to_vlm = {
                     let mut last_send = last_vlm_send.lock().map_err(|_| gst::FlowError::Error)?;
@@ -306,7 +305,7 @@ mod tests {
         let pipeline = build_pipeline(TEST_PIPELINE_STR).expect("failed to build test pipeline");
         let appsink = pipeline_appsink(&pipeline).expect("missing test appsink");
 
-        let (live_stream_tx, mut live_stream_rx) = mpsc::channel::<Vec<u8>>(2);
+        let (live_stream_tx, mut live_stream_rx) = broadcast::channel::<Vec<u8>>(2);
         let (vlm_tx, mut vlm_rx) = mpsc::channel::<Vec<u8>>(1);
 
         install_appsink_callbacks(

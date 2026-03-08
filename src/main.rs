@@ -17,9 +17,11 @@ use std::thread;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
+use futures_util::SinkExt;
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use camera::{
@@ -42,6 +44,24 @@ async fn main() -> Result<()> {
     run().await
 }
 
+async fn serve_ws_client(
+    stream: tokio::net::TcpStream,
+    mut rx: broadcast::Receiver<Vec<u8>>,
+) -> Result<()> {
+    let ws = tokio_tungstenite::accept_async(stream).await?;
+    let (mut sink, _source) = futures_util::StreamExt::split(ws);
+    loop {
+        match rx.recv().await {
+            Ok(frame_bytes) => sink.send(Message::Binary(frame_bytes.into())).await?,
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!("WebSocket client lagged, dropped {n} frames");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+    Ok(())
+}
+
 async fn run() -> Result<()> {
     let camera_config = resolve_camera_config()?;
 
@@ -53,9 +73,9 @@ async fn run() -> Result<()> {
     let appsink = pipeline_appsink(&pipeline).context("failed to access appsink named `sink`")?;
 
     // Two fan-out channels:
-    // - live_stream: latest JPEG frames for WebSocket streaming (TODO)
+    // - live_stream: broadcast of JPEG frames to all WebSocket clients
     // - vlm: one JPEG roughly every second for Gemini analysis
-    let (live_stream_tx, mut live_stream_rx) = mpsc::channel::<Vec<u8>>(2);
+    let (live_stream_tx, _) = broadcast::channel::<Vec<u8>>(16);
     let (vlm_tx, mut vlm_rx) = mpsc::channel::<Vec<u8>>(1);
 
     let live_stream_callback_tx = live_stream_tx.clone();
@@ -69,7 +89,6 @@ async fn run() -> Result<()> {
         Arc::clone(&last_vlm_send),
     );
 
-    drop(live_stream_tx);
     drop(vlm_tx);
 
     // Build the memory system.
@@ -84,11 +103,33 @@ async fn run() -> Result<()> {
         FrameStore::new("./argus_store", 10).context("failed to create frame store")?;
     let mut memory = MemorySystem::new(gemini_client, frame_store, Some(PathBuf::from("./argus_graph.json")));
 
-    // Live stream placeholder — TODO: forward to WebSocket.
+    // WebSocket server — broadcasts live JPEG frames to connected clients.
+    let ws_port: u16 = std::env::var("ARGUS_WS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8765);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", ws_port))
+        .await
+        .context("failed to bind WebSocket listener")?;
+    info!("WebSocket live feed on ws://0.0.0.0:{ws_port}/");
+
     let live_task = tokio::spawn(async move {
-        while let Some(frame_bytes) = live_stream_rx.recv().await {
-            info!("Live frame: {} bytes", frame_bytes.len());
-            // TODO: send over WebSocket to desktop app
+        loop {
+            match listener.accept().await {
+                Ok((stream, addr)) => {
+                    info!("WebSocket client connected: {addr}");
+                    let rx = live_stream_tx.subscribe();
+                    tokio::spawn(async move {
+                        if let Err(e) = serve_ws_client(stream, rx).await {
+                            warn!("WebSocket client {addr} disconnected: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("WebSocket accept error: {e}");
+                    break;
+                }
+            }
         }
     });
 
