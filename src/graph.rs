@@ -14,7 +14,7 @@ use crate::error::{ArgusError, Result};
 pub struct EntityNode {
     pub label: String,    // unique identifier, e.g. "coffee_cup"
     pub category: String, // "object" | "person" | "furniture" | "vehicle" | "animal"
-    pub confidence: f32,  // latest value from Gemini (0.0 – 1.0)
+    pub rank: u32,        // 1 = highest priority; assigned from Gemini response order
     #[serde(default)]
     pub crossed_out: bool, // true = dismissed from the suspicions list
 }
@@ -38,14 +38,12 @@ struct SnapshotRelation {
     object: String,
 }
 
-/// Entity shape sent over WebSocket — includes derived `rank`.
+/// Entity shape sent over WebSocket.
 #[derive(Serialize)]
 struct WsEntitySnapshot {
     rank: u32,
     label: String,
     category: String,
-    confidence: f32,
-    crossed_out: bool,
 }
 
 #[derive(Serialize)]
@@ -77,19 +75,19 @@ impl SpatialGraph {
 
     /// Insert or update an entity node.
     ///
-    /// If an entity with this label already exists, its confidence is updated
+    /// If an entity with this label already exists, its rank is updated
     /// to the latest value. If it's new, a node is inserted.
     ///
-    /// Python analogy: `graph.nodes[label].update({"confidence": ...})`
+    /// Python analogy: `graph.nodes[label].update({"rank": ...})`
     /// or `graph.add_node(label, ...)` if new.
-    pub fn upsert_entity(&mut self, label: &str, category: &str, confidence: f32) {
+    pub fn upsert_entity(&mut self, label: &str, category: &str, rank: u32) {
         if let Some(&idx) = self.label_to_node.get(label) {
-            self.graph[idx].confidence = confidence;
+            self.graph[idx].rank = rank;
         } else {
             let idx = self.graph.add_node(EntityNode {
                 label: label.to_string(),
                 category: category.to_string(),
-                confidence,
+                rank,
                 crossed_out: false,
             });
             self.label_to_node.insert(label.to_string(), idx);
@@ -134,7 +132,7 @@ impl SpatialGraph {
     ///
     /// Example output:
     /// ```text
-    /// Entities in memory: coffee_cup (object, 0.95), desk (furniture, 0.98)
+    /// Entities in memory: coffee_cup (object, #1), desk (furniture, #2)
     /// Relations: coffee_cup --on--> desk
     /// ```
     ///
@@ -150,7 +148,7 @@ impl SpatialGraph {
             .filter(|&idx| !self.graph[idx].crossed_out)
             .map(|idx| {
                 let n = &self.graph[idx];
-                format!("{} ({}, {:.2})", n.label, n.category, n.confidence)
+                format!("{} ({}, #{})", n.label, n.category, n.rank)
             })
             .collect();
 
@@ -226,7 +224,7 @@ impl SpatialGraph {
 
     /// Serialize the graph to a compact JSON string for WebSocket transmission.
     ///
-    /// Entities are sorted descending by confidence; `rank` is 1-based (1 = highest confidence).
+    /// Entities are sorted ascending by rank (rank 1 = highest priority).
     pub fn to_json(&self) -> Result<String> {
         let mut entities: Vec<WsEntitySnapshot> = self
             .graph
@@ -234,23 +232,14 @@ impl SpatialGraph {
             .map(|idx| {
                 let n = &self.graph[idx];
                 WsEntitySnapshot {
-                    rank: 0,
+                    rank: n.rank,
                     label: n.label.clone(),
                     category: n.category.clone(),
-                    confidence: n.confidence,
-                    crossed_out: n.crossed_out,
                 }
             })
             .collect();
 
-        entities.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for (i, e) in entities.iter_mut().enumerate() {
-            e.rank = (i + 1) as u32;
-        }
+        entities.sort_by_key(|e| e.rank);
 
         let relations: Vec<SnapshotRelation> = self
             .graph
@@ -274,7 +263,7 @@ impl SpatialGraph {
         let snapshot: GraphSnapshot = serde_json::from_str(&json)?;
         let mut graph = SpatialGraph::new();
         for entity in snapshot.entities {
-            graph.upsert_entity(&entity.label, &entity.category, entity.confidence);
+            graph.upsert_entity(&entity.label, &entity.category, entity.rank);
         }
         for rel in snapshot.relations {
             if let Err(e) = graph.upsert_relation(&rel.subject, &rel.relation, &rel.object) {
@@ -298,27 +287,27 @@ mod tests {
     #[test]
     fn insert_new_entity() {
         let mut g = SpatialGraph::new();
-        g.upsert_entity("cup", "object", 0.9);
+        g.upsert_entity("cup", "object", 1);
         assert_eq!(g.entity_count(), 1);
         assert!(g.contains_entity("cup"));
     }
 
     #[test]
-    fn upsert_same_entity_updates_confidence() {
+    fn upsert_same_entity_updates_rank() {
         let mut g = SpatialGraph::new();
-        g.upsert_entity("cup", "object", 0.8);
-        g.upsert_entity("cup", "object", 0.95);
-        // Still 1 node, confidence updated to latest
+        g.upsert_entity("cup", "object", 2);
+        g.upsert_entity("cup", "object", 1);
+        // Still 1 node, rank updated to latest
         assert_eq!(g.entity_count(), 1);
         let idx = g.label_to_node["cup"];
-        assert!((g.graph[idx].confidence - 0.95).abs() < 1e-5);
+        assert_eq!(g.graph[idx].rank, 1);
     }
 
     #[test]
     fn upsert_relation_between_known_entities() {
         let mut g = SpatialGraph::new();
-        g.upsert_entity("cup", "object", 0.9);
-        g.upsert_entity("desk", "furniture", 0.98);
+        g.upsert_entity("cup", "object", 1);
+        g.upsert_entity("desk", "furniture", 2);
         g.upsert_relation("cup", "on", "desk").unwrap();
         assert_eq!(g.relation_count(), 1);
     }
@@ -326,7 +315,7 @@ mod tests {
     #[test]
     fn upsert_relation_unknown_entity_returns_error() {
         let mut g = SpatialGraph::new();
-        g.upsert_entity("cup", "object", 0.9);
+        g.upsert_entity("cup", "object", 1);
         let result = g.upsert_relation("cup", "on", "ghost");
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -345,8 +334,8 @@ mod tests {
     #[test]
     fn to_context_string_with_entities_and_relations() {
         let mut g = SpatialGraph::new();
-        g.upsert_entity("cup", "object", 0.9);
-        g.upsert_entity("desk", "furniture", 0.95);
+        g.upsert_entity("cup", "object", 1);
+        g.upsert_entity("desk", "furniture", 2);
         g.upsert_relation("cup", "on", "desk").unwrap();
         let ctx = g.to_context_string();
         assert!(ctx.contains("cup"));

@@ -84,10 +84,10 @@ impl MemorySystem {
         // Step 2 — call Gemini (real or mock).
         let analysis = self.client.analyze_frame(&frame, &graph_context).await?;
 
-        // Step 3 — upsert entities.
-        for entity in &analysis.entities {
+        // Step 3 — upsert entities. Rank is the 1-based position in the Gemini response.
+        for (rank, entity) in analysis.entities.iter().enumerate() {
             self.graph
-                .upsert_entity(&entity.label, &entity.category, entity.confidence);
+                .upsert_entity(&entity.label, &entity.category, (rank + 1) as u32);
         }
 
         // Step 4 — save frame for each entity (skips if not novel).
@@ -184,16 +184,8 @@ mod tests {
     fn make_scene_analysis() -> SceneAnalysis {
         SceneAnalysis {
             entities: vec![
-                Entity {
-                    label: "coffee_cup".into(),
-                    category: "object".into(),
-                    confidence: 0.9,
-                },
-                Entity {
-                    label: "desk".into(),
-                    category: "furniture".into(),
-                    confidence: 0.95,
-                },
+                Entity { label: "coffee_cup".into(), category: "object".into() },
+                Entity { label: "desk".into(), category: "furniture".into() },
             ],
             relations: vec![SpatialRelation {
                 subject: "coffee_cup".into(),
@@ -221,7 +213,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_frames_confidence_updated() {
+    async fn two_frames_same_entities_upserted_not_duplicated() {
         let dir = TempDir::new().unwrap();
         let mut mock = MockGeminiClient::new();
         mock.expect_analyze_frame()
@@ -278,7 +270,6 @@ mod tests {
                     entities: vec![Entity {
                         label: "cup".into(),
                         category: "object".into(),
-                        confidence: 0.9,
                     }],
                     relations: vec![SpatialRelation {
                         subject: "cup".into(),

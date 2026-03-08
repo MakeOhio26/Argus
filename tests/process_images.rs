@@ -74,11 +74,6 @@ async fn process_images_end_to_end() {
                 "{name}: unknown category '{}'",
                 entity.category
             );
-            assert!(
-                (0.0..=1.0).contains(&entity.confidence),
-                "{name}: confidence {} out of [0,1]",
-                entity.confidence
-            );
         }
 
         let labels: HashSet<&str> =

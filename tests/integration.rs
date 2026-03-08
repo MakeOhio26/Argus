@@ -30,7 +30,7 @@ fn canned_gemini_response() -> serde_json::Value {
         "candidates": [{
             "content": {
                 "parts": [{
-                    "text": r#"{"entities":[{"label":"laptop","category":"object","confidence":0.92},{"label":"person_1","category":"person","confidence":0.98}],"relations":[{"subject":"person_1","relation":"uses","object":"laptop"}]}"#
+                    "text": r#"{"entities":[{"label":"laptop","category":"object"},{"label":"person_1","category":"person"}],"relations":[{"subject":"person_1","relation":"uses","object":"laptop"}]}"#
                 }]
             },
             "finishReason": "STOP"

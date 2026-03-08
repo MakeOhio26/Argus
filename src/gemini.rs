@@ -75,7 +75,6 @@ pub struct GeminiResponsePart {
 pub struct Entity {
     pub label: String,    // snake_case unique identifier, e.g. "coffee_cup"
     pub category: String, // "object" | "person" | "furniture" | "vehicle" | "animal"
-    pub confidence: f32,  // 0.0 – 1.0
 }
 
 /// A spatial relationship between two entities.
@@ -175,7 +174,7 @@ Current graph state:
 
 Analyze the new frame. Return ONLY a JSON object for entities/relations to ADD or UPDATE:
 {{
-  "entities": [{{"label": "<snake_case_name>", "category": "<object|person|furniture|vehicle|animal>", "confidence": <0.0-1.0>}}],
+  "entities": [{{"label": "<snake_case_name>", "category": "<object|person|furniture|vehicle|animal>"}}],
   "relations": [{{"subject": "<entity_label>", "relation": "<near|on|above|below|holds|faces>", "object": "<entity_label>"}}]
 }}
 No markdown fences, no explanation. Only valid JSON."#
@@ -296,7 +295,7 @@ mod tests {
 
     #[test]
     fn parse_clean_json_response() {
-        let json = r#"{"entities":[{"label":"coffee_cup","category":"object","confidence":0.95}],"relations":[]}"#;
+        let json = r#"{"entities":[{"label":"coffee_cup","category":"object"}],"relations":[]}"#;
         let analysis = parse_scene_analysis(make_response(json)).unwrap();
         assert_eq!(analysis.entities.len(), 1);
         assert_eq!(analysis.entities[0].label, "coffee_cup");
@@ -305,7 +304,7 @@ mod tests {
 
     #[test]
     fn parse_markdown_fenced_response() {
-        let fenced = "```json\n{\"entities\":[{\"label\":\"desk\",\"category\":\"furniture\",\"confidence\":0.9}],\"relations\":[]}\n```";
+        let fenced = "```json\n{\"entities\":[{\"label\":\"desk\",\"category\":\"furniture\"}],\"relations\":[]}\n```";
         let analysis = parse_scene_analysis(make_response(fenced)).unwrap();
         assert_eq!(analysis.entities[0].label, "desk");
     }
@@ -345,7 +344,7 @@ mod tests {
         let fake_body = serde_json::json!({
             "candidates": [{
                 "content": {
-                    "parts": [{"text": r#"{"entities":[{"label":"laptop","category":"object","confidence":0.92}],"relations":[]}"#}]
+                    "parts": [{"text": r#"{"entities":[{"label":"laptop","category":"object"}],"relations":[]}"#}]
                 },
                 "finishReason": "STOP"
             }]
