@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -74,11 +75,23 @@ impl MemorySystem {
     /// 3. Upsert all returned entities into the graph.
     /// 4. Attempt to store the frame for each entity (novel-perspective only).
     /// 5. Upsert all returned relations (invalid ones are warned and skipped).
+    /// 6. Apply crossed-out state based on VLM visibility + VOC trend.
+    /// 7. Persist the graph to disk.
     ///
     /// Rust concept: `&mut self` means this method has exclusive mutable access
     /// to the struct — equivalent to Python's `self` but the borrow checker
     /// ensures nothing else can read or write `MemorySystem` at the same time.
     pub async fn process_frame(&mut self, frame: Frame) -> Result<()> {
+        self.process_frame_with_voc_trend(frame, false).await
+    }
+
+    /// Same as [`Self::process_frame`], but applies crossed-out state using a
+    /// caller-provided VOC trend classification.
+    pub async fn process_frame_with_voc_trend(
+        &mut self,
+        frame: Frame,
+        voc_increasing: bool,
+    ) -> Result<()> {
         // Step 1 — snapshot current graph as context for the prompt.
         let graph_context = self.graph.to_context_string();
 
@@ -115,7 +128,13 @@ impl MemorySystem {
             }
         }
 
-        // Step 6 — persist updated graph to disk (if a path was configured).
+        // Step 6 — update crossed-out state using the current VLM visibility and
+        // the caller-provided VOC trend classification.
+        let visible_labels: HashSet<String> =
+            analysis.entities.iter().map(|entity| entity.label.clone()).collect();
+        self.apply_crossed_out_state(&visible_labels, voc_increasing);
+
+        // Step 7 — persist updated graph to disk (if a path was configured).
         if let Some(path) = &self.graph_path {
             if let Err(e) = self.graph.save(path) {
                 warn!("Failed to save graph to {}: {e}", path.display());
@@ -157,6 +176,25 @@ impl MemorySystem {
     pub fn get_entity_latest_frame(&self, entity_label: &str) -> Result<Option<Vec<u8>>> {
         self.frame_store.load_latest(entity_label)
     }
+
+    fn apply_crossed_out_state(&mut self, visible_labels: &HashSet<String>, voc_increasing: bool) {
+        for label in self.graph.labels() {
+            let is_visible = visible_labels.contains(&label);
+            let is_crossed_out = self.graph.is_crossed_out(&label).unwrap_or(false);
+
+            if is_visible {
+                if is_crossed_out && voc_increasing {
+                    if let Err(e) = self.graph.set_crossed_out(&label, false) {
+                        warn!("Failed to clear crossed_out for '{label}': {e}");
+                    }
+                }
+            } else if voc_increasing {
+                if let Err(e) = self.graph.set_crossed_out(&label, true) {
+                    warn!("Failed to set crossed_out for '{label}': {e}");
+                }
+            }
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -168,6 +206,8 @@ mod tests {
     use crate::frame::Frame;
     use crate::frame_store::FrameStore;
     use crate::gemini::{Entity, MockGeminiClient, SceneAnalysis, SpatialRelation};
+    use crate::voc::{VocTrendConfig, VocTrendTracker};
+    use mockall::Sequence;
     use tempfile::TempDir;
 
     fn make_frame(id: &str) -> Frame {
@@ -194,6 +234,50 @@ mod tests {
                 object: "desk".into(),
             }],
             raw_text: "{}".into(),
+        }
+    }
+
+    fn analysis_with_entities(labels: &[&str]) -> SceneAnalysis {
+        SceneAnalysis {
+            entities: labels
+                .iter()
+                .enumerate()
+                .map(|(idx, label)| Entity {
+                    label: (*label).into(),
+                    category: if idx == 0 { "object".into() } else { "furniture".into() },
+                })
+                .collect(),
+            relations: vec![],
+            raw_text: "{}".into(),
+        }
+    }
+
+    async fn process_sequence_with_sensor_data(
+        memory: &mut MemorySystem,
+        analyses: Vec<SceneAnalysis>,
+        samples: &[f64],
+        config: VocTrendConfig,
+    ) {
+        assert_eq!(
+            analyses.len(),
+            samples.len(),
+            "expected one VOC sample per VLM analysis"
+        );
+
+        let mut tracker = VocTrendTracker::new(config);
+        for (index, (analysis, sample)) in analyses.into_iter().zip(samples.iter()).enumerate() {
+            let mut mock = MockGeminiClient::new();
+            mock.expect_analyze_frame()
+                .times(1)
+                .return_once(move |_, _| Ok(analysis));
+
+            let frame = make_frame(&format!("f{index}"));
+            memory.client = Box::new(mock);
+            let voc_increasing = tracker.record(*sample);
+            memory
+                .process_frame_with_voc_trend(frame, voc_increasing)
+                .await
+                .unwrap();
         }
     }
 
@@ -288,5 +372,205 @@ mod tests {
         memory.process_frame(make_frame("f1")).await.unwrap();
         assert_eq!(memory.query(|g| g.entity_count()), 1);
         assert_eq!(memory.query(|g| g.relation_count()), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_entity_and_rising_voc_marks_node_crossed_out() {
+        let dir = TempDir::new().unwrap();
+        let mut mock = MockGeminiClient::new();
+        let mut seq = Sequence::new();
+        mock.expect_analyze_frame()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(|_, _| Ok(analysis_with_entities(&["coffee_cup", "desk"])));
+        mock.expect_analyze_frame()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(|_, _| Ok(analysis_with_entities(&["coffee_cup"])));
+
+        let store = Arc::new(FrameStore::new(dir.path(), 10).unwrap());
+        let mut memory = MemorySystem::new(Box::new(mock), store, None);
+
+        memory
+            .process_frame_with_voc_trend(make_frame("f1"), false)
+            .await
+            .unwrap();
+        memory
+            .process_frame_with_voc_trend(make_frame("f2"), true)
+            .await
+            .unwrap();
+
+        assert_eq!(memory.query(|g| g.is_crossed_out("desk")), Some(true));
+    }
+
+    #[tokio::test]
+    async fn missing_entity_without_rising_voc_leaves_state_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let mut mock = MockGeminiClient::new();
+        let mut seq = Sequence::new();
+        mock.expect_analyze_frame()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(|_, _| Ok(analysis_with_entities(&["coffee_cup", "desk"])));
+        mock.expect_analyze_frame()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(|_, _| Ok(analysis_with_entities(&["coffee_cup"])));
+
+        let store = Arc::new(FrameStore::new(dir.path(), 10).unwrap());
+        let mut memory = MemorySystem::new(Box::new(mock), store, None);
+
+        memory
+            .process_frame_with_voc_trend(make_frame("f1"), false)
+            .await
+            .unwrap();
+        memory
+            .process_frame_with_voc_trend(make_frame("f2"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(memory.query(|g| g.is_crossed_out("desk")), Some(false));
+    }
+
+    #[tokio::test]
+    async fn crossed_out_entity_only_uncrosses_when_voc_is_rising() {
+        let dir = TempDir::new().unwrap();
+        let mut mock = MockGeminiClient::new();
+        let mut seq = Sequence::new();
+        mock.expect_analyze_frame()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(|_, _| Ok(analysis_with_entities(&["coffee_cup", "desk"])));
+        mock.expect_analyze_frame()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(|_, _| Ok(analysis_with_entities(&["coffee_cup"])));
+        mock.expect_analyze_frame()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(|_, _| Ok(analysis_with_entities(&["coffee_cup", "desk"])));
+        mock.expect_analyze_frame()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(|_, _| Ok(analysis_with_entities(&["coffee_cup", "desk"])));
+
+        let store = Arc::new(FrameStore::new(dir.path(), 10).unwrap());
+        let mut memory = MemorySystem::new(Box::new(mock), store, None);
+
+        memory
+            .process_frame_with_voc_trend(make_frame("f1"), false)
+            .await
+            .unwrap();
+        memory
+            .process_frame_with_voc_trend(make_frame("f2"), true)
+            .await
+            .unwrap();
+        assert_eq!(memory.query(|g| g.is_crossed_out("desk")), Some(true));
+
+        memory
+            .process_frame_with_voc_trend(make_frame("f3"), false)
+            .await
+            .unwrap();
+        assert_eq!(memory.query(|g| g.is_crossed_out("desk")), Some(true));
+
+        memory
+            .process_frame_with_voc_trend(make_frame("f4"), true)
+            .await
+            .unwrap();
+        assert_eq!(memory.query(|g| g.is_crossed_out("desk")), Some(false));
+    }
+
+    #[tokio::test]
+    async fn crossed_out_nodes_remain_in_persisted_graph_json() {
+        let dir = TempDir::new().unwrap();
+        let graph_path = dir.path().join("graph.json");
+        let mut mock = MockGeminiClient::new();
+        let mut seq = Sequence::new();
+        mock.expect_analyze_frame()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(|_, _| Ok(analysis_with_entities(&["coffee_cup", "desk"])));
+        mock.expect_analyze_frame()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(|_, _| Ok(analysis_with_entities(&["coffee_cup"])));
+
+        let store = Arc::new(FrameStore::new(dir.path(), 10).unwrap());
+        let mut memory =
+            MemorySystem::new(Box::new(mock), store, Some(graph_path.clone()));
+
+        memory
+            .process_frame_with_voc_trend(make_frame("f1"), false)
+            .await
+            .unwrap();
+        memory
+            .process_frame_with_voc_trend(make_frame("f2"), true)
+            .await
+            .unwrap();
+
+        let json = std::fs::read_to_string(graph_path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let desk = value["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entity| entity["label"] == "desk")
+            .unwrap();
+        assert_eq!(desk["crossed_out"], true);
+    }
+
+    #[tokio::test]
+    async fn noisy_sensor_sequence_does_not_cross_out_missing_node() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(FrameStore::new(dir.path(), 10).unwrap());
+        let mut memory = MemorySystem::new(Box::new(MockGeminiClient::new()), store, None);
+
+        process_sequence_with_sensor_data(
+            &mut memory,
+            vec![
+                analysis_with_entities(&["coffee_cup", "desk"]),
+                analysis_with_entities(&["coffee_cup"]),
+                analysis_with_entities(&["coffee_cup"]),
+                analysis_with_entities(&["coffee_cup"]),
+                analysis_with_entities(&["coffee_cup"]),
+                analysis_with_entities(&["coffee_cup"]),
+            ],
+            &[10.0, 11.0, 10.0, 11.0, 10.0, 11.0],
+            VocTrendConfig {
+                avg_window: 3,
+                rising_steps: 2,
+            },
+        )
+        .await;
+
+        assert_eq!(memory.query(|g| g.is_crossed_out("desk")), Some(false));
+    }
+
+    #[tokio::test]
+    async fn sustained_rise_sequence_crosses_out_and_later_uncrosses_on_reappearance() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(FrameStore::new(dir.path(), 10).unwrap());
+        let mut memory = MemorySystem::new(Box::new(MockGeminiClient::new()), store, None);
+
+        process_sequence_with_sensor_data(
+            &mut memory,
+            vec![
+                analysis_with_entities(&["coffee_cup", "desk"]),
+                analysis_with_entities(&["coffee_cup"]),
+                analysis_with_entities(&["coffee_cup"]),
+                analysis_with_entities(&["coffee_cup"]),
+                analysis_with_entities(&["coffee_cup", "desk"]),
+                analysis_with_entities(&["coffee_cup", "desk"]),
+                analysis_with_entities(&["coffee_cup", "desk"]),
+            ],
+            &[1.0, 2.0, 3.0, 4.0, 3.0, 5.0, 6.0],
+            VocTrendConfig {
+                avg_window: 2,
+                rising_steps: 2,
+            },
+        )
+        .await;
+
+        assert_eq!(memory.query(|g| g.is_crossed_out("desk")), Some(false));
     }
 }

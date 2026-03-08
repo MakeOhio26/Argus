@@ -271,7 +271,7 @@ async fn run() -> Result<()> {
             counter += 1;
             match Frame::new(format!("frame_{counter}"), frame_bytes) {
                 Ok(frame) => {
-                    if let Err(e) = memory.process_frame(frame).await {
+                    if let Err(e) = memory.process_frame_with_voc_trend(frame, false).await {
                         warn!("Memory update failed: {e}");
                     } else {
                         info!(

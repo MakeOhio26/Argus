@@ -28,3 +28,4 @@ pub mod frame_store;
 pub mod gemini;
 pub mod graph;
 pub mod memory;
+pub mod voc;
