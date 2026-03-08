@@ -1,0 +1,31 @@
+{
+  "entities": [
+    {
+      "label": "light_surface",
+      "category": "object",
+      "confidence": 0.95
+    },
+    {
+      "label": "diagonal_dark_strip",
+      "category": "object",
+      "confidence": 0.9
+    },
+    {
+      "label": "top_left_dark_fragment",
+      "category": "object",
+      "confidence": 0.2
+    }
+  ],
+  "relations": [
+    {
+      "subject": "diagonal_dark_strip",
+      "relation": "on",
+      "object": "light_surface"
+    },
+    {
+      "subject": "top_left_dark_fragment",
+      "relation": "on",
+      "object": "light_surface"
+    }
+  ]
+}

@@ -11,7 +11,7 @@ use argus::frame_store::FrameStore;
 use argus::gemini::ReqwestGeminiClient;
 use argus::memory::MemorySystem;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -104,14 +104,16 @@ async fn run() -> Result<()> {
     let mut memory = MemorySystem::new(gemini_client, frame_store, Some(PathBuf::from("./argus_graph.json")));
 
     // WebSocket server — broadcasts live JPEG frames to connected clients.
+    let ws_bind_addr = std::env::var("ARGUS_WS_BIND_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0".to_string());
     let ws_port: u16 = std::env::var("ARGUS_WS_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8765);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", ws_port))
+    let listener = tokio::net::TcpListener::bind((ws_bind_addr.as_str(), ws_port))
         .await
         .context("failed to bind WebSocket listener")?;
-    info!("WebSocket live feed on ws://0.0.0.0:{ws_port}/");
+    log_ws_listener(&ws_bind_addr, ws_port);
 
     let live_task = tokio::spawn(async move {
         loop {
@@ -205,4 +207,15 @@ async fn run() -> Result<()> {
     }
 
     shutdown_pipeline(pipeline, appsink, live_task, vlm_task).await
+}
+
+fn log_ws_listener(bind_addr: &str, ws_port: u16) {
+    info!("WebSocket live feed listening on {bind_addr}:{ws_port}");
+
+    if bind_addr == "0.0.0.0" {
+        info!("Connect locally via ws://127.0.0.1:{ws_port}/");
+        info!("Connect remotely via ws://<device-ip>:{ws_port}/");
+    } else {
+        info!("Connect via ws://{bind_addr}:{ws_port}/");
+    }
 }
