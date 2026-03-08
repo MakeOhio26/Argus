@@ -50,7 +50,7 @@ pub struct RealTransport {
 
 impl RealTransport {
     pub fn new(port_name: &str, baud: u32) -> Result<Self, RoverError> {
-        let mut port = serialport::new(port_name, baud)
+        let port = serialport::new(port_name, baud)
             .timeout(Duration::from_millis(500))
             .open()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
