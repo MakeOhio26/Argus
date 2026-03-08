@@ -10,6 +10,7 @@ use argus::frame::Frame;
 use argus::frame_store::FrameStore;
 use argus::gemini::{ReqwestGeminiClient, StubGeminiClient};
 use argus::memory::MemorySystem;
+use argus::rover::{DefaultRoverClient, RoverError};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -44,12 +45,43 @@ async fn main() -> Result<()> {
     run().await
 }
 
+/// Run a blocking rover command on the thread pool and return a JSON response value.
+async fn invoke_rover<F>(
+    rover: &Arc<std::sync::Mutex<Option<DefaultRoverClient>>>,
+    command: &'static str,
+    f: F,
+) -> serde_json::Value
+where
+    F: FnOnce(&mut DefaultRoverClient) -> Result<String, RoverError> + Send + 'static,
+{
+    let rover_clone = Arc::clone(rover);
+    let result = tokio::task::spawn_blocking(move || {
+        let mut guard = rover_clone.lock().unwrap();
+        match guard.as_mut() {
+            None => Err("rover not connected".to_string()),
+            Some(r) => f(r).map_err(|e| e.to_string()),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(response)) => serde_json::json!({
+            "type": "rover_result",
+            "command": command,
+            "response": response,
+        }),
+        Ok(Err(msg)) => serde_json::json!({ "type": "error", "message": msg }),
+        Err(_) => serde_json::json!({ "type": "error", "message": "internal task error" }),
+    }
+}
+
 async fn serve_ws_client(
     stream: tokio::net::TcpStream,
     mut frame_rx: broadcast::Receiver<Vec<u8>>,
     mut graph_rx: broadcast::Receiver<String>,
     initial_graph: Arc<RwLock<String>>,
     frame_store: Arc<FrameStore>,
+    rover: Arc<std::sync::Mutex<Option<DefaultRoverClient>>>,
 ) -> Result<()> {
     use futures_util::StreamExt;
 
@@ -127,6 +159,66 @@ async fn serve_ws_client(
                                             let _ = sink.send(Message::Text(
                                                 r#"{"type":"error","message":"failed to load entity images"}"#.into()
                                             )).await;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(v) if v["type"] == "rover_ping" => {
+                                let json = invoke_rover(&rover, "ping", |r| r.ping()).await;
+                                if let Ok(s) = serde_json::to_string(&json) {
+                                    let _ = sink.send(Message::Text(s.into())).await;
+                                }
+                            }
+                            Ok(v) if v["type"] == "rover_read_air" => {
+                                let json = invoke_rover(&rover, "read_air", |r| r.read_air()).await;
+                                if let Ok(s) = serde_json::to_string(&json) {
+                                    let _ = sink.send(Message::Text(s.into())).await;
+                                }
+                            }
+                            Ok(v) if v["type"] == "rover_read_motion" => {
+                                let json = invoke_rover(&rover, "read_motion", |r| r.read_motion()).await;
+                                if let Ok(s) = serde_json::to_string(&json) {
+                                    let _ = sink.send(Message::Text(s.into())).await;
+                                }
+                            }
+                            Ok(v) if v["type"] == "rover_zero" => {
+                                let json = invoke_rover(&rover, "zero", |r| r.zero()).await;
+                                if let Ok(s) = serde_json::to_string(&json) {
+                                    let _ = sink.send(Message::Text(s.into())).await;
+                                }
+                            }
+                            Ok(v) if v["type"] == "rover_stop" => {
+                                let json = invoke_rover(&rover, "stop", |r| r.stop()).await;
+                                if let Ok(s) = serde_json::to_string(&json) {
+                                    let _ = sink.send(Message::Text(s.into())).await;
+                                }
+                            }
+                            Ok(v) if v["type"] == "rover_rotate" => {
+                                match v["degrees"].as_f64() {
+                                    None => {
+                                        let _ = sink.send(Message::Text(
+                                            r#"{"type":"error","message":"missing or invalid degrees field"}"#.into()
+                                        )).await;
+                                    }
+                                    Some(deg) => {
+                                        let json = invoke_rover(&rover, "rotate", move |r| r.rotate(deg)).await;
+                                        if let Ok(s) = serde_json::to_string(&json) {
+                                            let _ = sink.send(Message::Text(s.into())).await;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(v) if v["type"] == "rover_distance" => {
+                                match v["centimeters"].as_f64() {
+                                    None => {
+                                        let _ = sink.send(Message::Text(
+                                            r#"{"type":"error","message":"missing or invalid centimeters field"}"#.into()
+                                        )).await;
+                                    }
+                                    Some(cm) => {
+                                        let json = invoke_rover(&rover, "distance", move |r| r.distance(cm)).await;
+                                        if let Ok(s) = serde_json::to_string(&json) {
+                                            let _ = sink.send(Message::Text(s.into())).await;
                                         }
                                     }
                                 }
@@ -209,6 +301,33 @@ async fn run() -> Result<()> {
     })
     .context("failed to install Ctrl+C handler")?;
 
+    let (shutdown_tx, _) = watch::channel(false);
+    let mut shutdown_signal_rx = shutdown_tx.subscribe();
+    let ctrlc_shutdown_tx = shutdown_tx.clone();
+    ctrlc::set_handler(move || {
+        let _ = ctrlc_shutdown_tx.send(true);
+    })
+    .context("failed to install Ctrl+C handler")?;
+
+    // Rover serial client — optional, gated on ARGUS_ROVER_PORT env var.
+    let rover_client: Arc<std::sync::Mutex<Option<DefaultRoverClient>>> =
+        match std::env::var("ARGUS_ROVER_PORT") {
+            Err(_) => {
+                info!("ARGUS_ROVER_PORT not set — rover commands will return 'not connected'");
+                Arc::new(std::sync::Mutex::new(None))
+            }
+            Ok(port) => match argus::rover::open(&port) {
+                Ok(client) => {
+                    info!("Rover connected on {port}");
+                    Arc::new(std::sync::Mutex::new(Some(client)))
+                }
+                Err(e) => {
+                    warn!("Failed to open rover on {port}: {e} — continuing without rover");
+                    Arc::new(std::sync::Mutex::new(None))
+                }
+            },
+        };
+
     // WebSocket server — broadcasts live JPEG frames to connected clients.
     let ws_bind_addr = std::env::var("ARGUS_WS_BIND_ADDR")
         .unwrap_or_else(|_| "0.0.0.0".to_string());
@@ -223,6 +342,7 @@ async fn run() -> Result<()> {
 
     let current_graph_listener = Arc::clone(&current_graph);
     let frame_store_listener = Arc::clone(&frame_store);
+    let rover_listener = Arc::clone(&rover_client);
     let mut live_shutdown_rx = shutdown_tx.subscribe();
     let live_task = tokio::spawn(async move {
         loop {
@@ -241,8 +361,9 @@ async fn run() -> Result<()> {
                             let graph_rx = graph_tx.subscribe();
                             let initial = Arc::clone(&current_graph_listener);
                             let store = Arc::clone(&frame_store_listener);
+                    let rover = Arc::clone(&rover_listener);
                             tokio::spawn(async move {
-                                if let Err(e) = serve_ws_client(stream, frame_rx, graph_rx, initial, store).await {
+                                if let Err(e) = serve_ws_client(stream, frame_rx, graph_rx, initial, store, rover).await {
                                     warn!("WebSocket client {addr} disconnected: {e}");
                                 }
                             });
