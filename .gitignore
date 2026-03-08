@@ -30,3 +30,6 @@ target
 
 # Frame store (runtime data)
 /argus_store/
+
+# VSCode
+.vscode/
