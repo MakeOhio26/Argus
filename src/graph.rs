@@ -15,6 +15,8 @@ pub struct EntityNode {
     pub label: String,    // unique identifier, e.g. "coffee_cup"
     pub category: String, // "object" | "person" | "furniture" | "vehicle" | "animal"
     pub confidence: f32,  // latest value from Gemini (0.0 – 1.0)
+    #[serde(default)]
+    pub crossed_out: bool, // true = dismissed from the suspicions list
 }
 
 /// A directed spatial relationship between two entities — one edge in the graph.
@@ -34,6 +36,22 @@ struct SnapshotRelation {
     subject: String,
     relation: String,
     object: String,
+}
+
+/// Entity shape sent over WebSocket — includes derived `rank`.
+#[derive(Serialize)]
+struct WsEntitySnapshot {
+    rank: u32,
+    label: String,
+    category: String,
+    confidence: f32,
+    crossed_out: bool,
+}
+
+#[derive(Serialize)]
+struct WsGraphSnapshot {
+    entities: Vec<WsEntitySnapshot>,
+    relations: Vec<SnapshotRelation>,
 }
 
 /// The spatial semantic graph.
@@ -72,6 +90,7 @@ impl SpatialGraph {
                 label: label.to_string(),
                 category: category.to_string(),
                 confidence,
+                crossed_out: false,
             });
             self.label_to_node.insert(label.to_string(), idx);
         }
@@ -128,6 +147,7 @@ impl SpatialGraph {
         let entity_list: Vec<String> = self
             .graph
             .node_indices()
+            .filter(|&idx| !self.graph[idx].crossed_out)
             .map(|idx| {
                 let n = &self.graph[idx];
                 format!("{} ({}, {:.2})", n.label, n.category, n.confidence)
@@ -137,6 +157,10 @@ impl SpatialGraph {
         let relation_list: Vec<String> = self
             .graph
             .edge_indices()
+            .filter(|&eidx| {
+                let (src, dst) = self.graph.edge_endpoints(eidx).unwrap();
+                !self.graph[src].crossed_out && !self.graph[dst].crossed_out
+            })
             .map(|eidx| {
                 let (src, dst) = self.graph.edge_endpoints(eidx).unwrap();
                 let src_label = &self.graph[src].label;
@@ -198,6 +222,50 @@ impl SpatialGraph {
         let json = serde_json::to_string_pretty(&GraphSnapshot { entities, relations })?;
         std::fs::write(path, json)?;
         Ok(())
+    }
+
+    /// Serialize the graph to a compact JSON string for WebSocket transmission.
+    ///
+    /// Entities are sorted descending by confidence; `rank` is 1-based (1 = highest confidence).
+    pub fn to_json(&self) -> Result<String> {
+        let mut entities: Vec<WsEntitySnapshot> = self
+            .graph
+            .node_indices()
+            .map(|idx| {
+                let n = &self.graph[idx];
+                WsEntitySnapshot {
+                    rank: 0,
+                    label: n.label.clone(),
+                    category: n.category.clone(),
+                    confidence: n.confidence,
+                    crossed_out: n.crossed_out,
+                }
+            })
+            .collect();
+
+        entities.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (i, e) in entities.iter_mut().enumerate() {
+            e.rank = (i + 1) as u32;
+        }
+
+        let relations: Vec<SnapshotRelation> = self
+            .graph
+            .edge_indices()
+            .map(|eidx| {
+                let (src, dst) = self.graph.edge_endpoints(eidx).unwrap();
+                SnapshotRelation {
+                    subject: self.graph[src].label.clone(),
+                    relation: self.graph[eidx].relation.clone(),
+                    object: self.graph[dst].label.clone(),
+                }
+            })
+            .collect();
+
+        Ok(serde_json::to_string(&WsGraphSnapshot { entities, relations })?)
     }
 
     /// Load a graph from a JSON file previously written by [`SpatialGraph::save`].

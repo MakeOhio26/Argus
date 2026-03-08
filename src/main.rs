@@ -20,7 +20,7 @@ use anyhow::{Context, Result, anyhow};
 use futures_util::SinkExt;
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
@@ -46,17 +46,67 @@ async fn main() -> Result<()> {
 
 async fn serve_ws_client(
     stream: tokio::net::TcpStream,
-    mut rx: broadcast::Receiver<Vec<u8>>,
+    mut frame_rx: broadcast::Receiver<Vec<u8>>,
+    mut graph_rx: broadcast::Receiver<String>,
+    initial_graph: Arc<RwLock<String>>,
 ) -> Result<()> {
+    use futures_util::StreamExt;
+
     let ws = tokio_tungstenite::accept_async(stream).await?;
-    let (mut sink, _source) = futures_util::StreamExt::split(ws);
+    let (mut sink, mut source) = ws.split();
+
+    // Send current graph snapshot immediately on connect (if one exists).
+    {
+        let cell = initial_graph.read().await;
+        if !cell.is_empty() {
+            sink.send(Message::Text(cell.clone().into())).await?;
+        }
+    }
+
     loop {
-        match rx.recv().await {
-            Ok(frame_bytes) => sink.send(Message::Binary(frame_bytes.into())).await?,
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!("WebSocket client lagged, dropped {n} frames");
+        tokio::select! {
+            result = frame_rx.recv() => {
+                match result {
+                    Ok(bytes) => sink.send(Message::Binary(bytes.into())).await?,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("WebSocket client lagged on video, dropped {n} frames");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
-            Err(broadcast::error::RecvError::Closed) => break,
+            result = graph_rx.recv() => {
+                match result {
+                    Ok(json) => sink.send(Message::Text(json.into())).await?,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("WebSocket client lagged on graph, dropped {n} updates");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            maybe_msg = source.next() => {
+                match maybe_msg {
+                    None => break,
+                    Some(Err(e)) => { warn!("WebSocket receive error: {e}"); break; }
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<serde_json::Value>(&text) {
+                            Ok(v) if v["type"] == "get_graph" => {
+                                let cell = initial_graph.read().await;
+                                if !cell.is_empty() {
+                                    sink.send(Message::Text(cell.clone().into())).await?;
+                                }
+                            }
+                            Ok(_) => {
+                                let _ = sink.send(Message::Text(
+                                    r#"{"type":"error","message":"unrecognized message"}"#.into()
+                                )).await;
+                            }
+                            Err(_) => warn!("Malformed WebSocket message"),
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {} // ignore binary/ping/pong from client
+                }
+            }
         }
     }
     Ok(())
@@ -78,6 +128,12 @@ async fn run() -> Result<()> {
     // - vlm: one JPEG roughly every second for Gemini analysis
     let (live_stream_tx, _) = broadcast::channel::<Vec<u8>>(16);
     let (vlm_tx, mut vlm_rx) = mpsc::channel::<Vec<u8>>(1);
+
+    // Graph update broadcast: pushes JSON text to all connected WS clients after each VLM frame.
+    let (graph_tx, _) = broadcast::channel::<String>(8);
+    let graph_tx_vlm = graph_tx.clone();
+    // Shared latest graph envelope — new connections read this for an immediate snapshot.
+    let current_graph: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
 
     let live_stream_callback_tx = live_stream_tx.clone();
     let vlm_callback_tx = vlm_tx.clone();
@@ -121,14 +177,17 @@ async fn run() -> Result<()> {
         .context("failed to bind WebSocket listener")?;
     log_ws_listener(&ws_bind_addr, ws_port);
 
+    let current_graph_listener = Arc::clone(&current_graph);
     let live_task = tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
                     info!("WebSocket client connected: {addr}");
-                    let rx = live_stream_tx.subscribe();
+                    let frame_rx = live_stream_tx.subscribe();
+                    let graph_rx = graph_tx.subscribe();
+                    let initial = Arc::clone(&current_graph_listener);
                     tokio::spawn(async move {
-                        if let Err(e) = serve_ws_client(stream, rx).await {
+                        if let Err(e) = serve_ws_client(stream, frame_rx, graph_rx, initial).await {
                             warn!("WebSocket client {addr} disconnected: {e}");
                         }
                     });
@@ -147,8 +206,10 @@ async fn run() -> Result<()> {
     // because only one frame is processed at a time — if Gemini is slow the
     // VLM channel fills up (capacity=1) and GStreamer drops the next frame,
     // which is intentional for a 1 FPS subsampled stream.
+    let current_graph_vlm = Arc::clone(&current_graph);
     let vlm_task = tokio::spawn(async move {
         let mut counter = 0u64;
+        let mut graph_seq = 0u64;
         while let Some(frame_bytes) = vlm_rx.recv().await {
             counter += 1;
             match Frame::new(format!("frame_{counter}"), frame_bytes) {
@@ -161,6 +222,25 @@ async fn run() -> Result<()> {
                             memory.query(|g| g.entity_count()),
                             memory.query(|g| g.relation_count()),
                         );
+                        // Serialize graph and push to all connected WS clients.
+                        match memory.graph_json() {
+                            Ok(inner) => {
+                                // Wrap in envelope: inject "type" and "seq" into the JSON object.
+                                match serde_json::from_str::<serde_json::Value>(&inner) {
+                                    Ok(mut val) => {
+                                        val["type"] = serde_json::json!("graph_update");
+                                        val["seq"]  = serde_json::json!(graph_seq);
+                                        if let Ok(envelope) = serde_json::to_string(&val) {
+                                            *current_graph_vlm.write().await = envelope.clone();
+                                            let _ = graph_tx_vlm.send(envelope);
+                                            graph_seq += 1;
+                                        }
+                                    }
+                                    Err(e) => warn!("Failed to wrap graph envelope: {e}"),
+                                }
+                            }
+                            Err(e) => warn!("Failed to serialize graph: {e}"),
+                        }
                     }
                 }
                 Err(e) => warn!("Invalid frame bytes: {e}"),

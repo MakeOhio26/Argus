@@ -142,6 +142,11 @@ impl MemorySystem {
         f(&self.graph)
     }
 
+    /// Serialize the current graph state to a compact JSON string for WebSocket transmission.
+    pub fn graph_json(&self) -> crate::error::Result<String> {
+        self.graph.to_json()
+    }
+
     /// Return all stored novel frames for `entity_label`, oldest-first.
     pub fn get_entity_frames(&self, entity_label: &str) -> Result<Vec<Vec<u8>>> {
         self.frame_store.load_all(entity_label)
