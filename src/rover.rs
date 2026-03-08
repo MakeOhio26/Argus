@@ -50,10 +50,18 @@ pub struct RealTransport {
 
 impl RealTransport {
     pub fn new(port_name: &str, baud: u32) -> Result<Self, RoverError> {
-        let port = serialport::new(port_name, baud)
+        let mut port = serialport::new(port_name, baud)
             .timeout(Duration::from_millis(500))
             .open()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        // The ESP32 resets when DTR is asserted on connect. Wait for it to
+        // finish booting (mirrors the Python client's time.sleep(2.0)), then
+        // flush any boot-time noise out of the input buffer.
+        std::thread::sleep(Duration::from_secs(2));
+        port.clear(serialport::ClearBuffer::Input)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
         let reader_port = port
             .try_clone()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
