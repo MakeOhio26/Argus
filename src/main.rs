@@ -21,7 +21,7 @@ use anyhow::{Context, Result, anyhow};
 use futures_util::SinkExt;
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
@@ -293,6 +293,22 @@ async fn run() -> Result<()> {
         Arc::new(FrameStore::new("./argus_store", 10).context("failed to create frame store")?);
     let mut memory = MemorySystem::new(gemini_client, Arc::clone(&frame_store), Some(PathBuf::from("./argus_graph.json")));
 
+    let (shutdown_tx, _) = watch::channel(false);
+    let mut shutdown_signal_rx = shutdown_tx.subscribe();
+    let ctrlc_shutdown_tx = shutdown_tx.clone();
+    ctrlc::set_handler(move || {
+        let _ = ctrlc_shutdown_tx.send(true);
+    })
+    .context("failed to install Ctrl+C handler")?;
+
+    let (shutdown_tx, _) = watch::channel(false);
+    let mut shutdown_signal_rx = shutdown_tx.subscribe();
+    let ctrlc_shutdown_tx = shutdown_tx.clone();
+    ctrlc::set_handler(move || {
+        let _ = ctrlc_shutdown_tx.send(true);
+    })
+    .context("failed to install Ctrl+C handler")?;
+
     // Rover serial client — optional, gated on ARGUS_ROVER_PORT env var.
     let rover_client: Arc<std::sync::Mutex<Option<DefaultRoverClient>>> =
         match std::env::var("ARGUS_ROVER_PORT") {
@@ -327,25 +343,36 @@ async fn run() -> Result<()> {
     let current_graph_listener = Arc::clone(&current_graph);
     let frame_store_listener = Arc::clone(&frame_store);
     let rover_listener = Arc::clone(&rover_client);
+    let mut live_shutdown_rx = shutdown_tx.subscribe();
     let live_task = tokio::spawn(async move {
         loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
-                    info!("WebSocket client connected: {addr}");
-                    let frame_rx = live_stream_tx.subscribe();
-                    let graph_rx = graph_tx.subscribe();
-                    let initial = Arc::clone(&current_graph_listener);
-                    let store = Arc::clone(&frame_store_listener);
-                    let rover = Arc::clone(&rover_listener);
-                    tokio::spawn(async move {
-                        if let Err(e) = serve_ws_client(stream, frame_rx, graph_rx, initial, store, rover).await {
-                            warn!("WebSocket client {addr} disconnected: {e}");
-                        }
-                    });
+            tokio::select! {
+                changed = live_shutdown_rx.changed() => {
+                    if changed.is_ok() && *live_shutdown_rx.borrow() {
+                        info!("WebSocket server shutting down");
+                        break;
+                    }
                 }
-                Err(e) => {
-                    error!("WebSocket accept error: {e}");
-                    break;
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, addr)) => {
+                            info!("WebSocket client connected: {addr}");
+                            let frame_rx = live_stream_tx.subscribe();
+                            let graph_rx = graph_tx.subscribe();
+                            let initial = Arc::clone(&current_graph_listener);
+                            let store = Arc::clone(&frame_store_listener);
+                    let rover = Arc::clone(&rover_listener);
+                            tokio::spawn(async move {
+                                if let Err(e) = serve_ws_client(stream, frame_rx, graph_rx, initial, store, rover).await {
+                                    warn!("WebSocket client {addr} disconnected: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("WebSocket accept error: {e}");
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -365,7 +392,7 @@ async fn run() -> Result<()> {
             counter += 1;
             match Frame::new(format!("frame_{counter}"), frame_bytes) {
                 Ok(frame) => {
-                    if let Err(e) = memory.process_frame(frame).await {
+                    if let Err(e) = memory.process_frame_with_voc_trend(frame, false).await {
                         warn!("Memory update failed: {e}");
                     } else {
                         info!(
@@ -425,14 +452,17 @@ async fn run() -> Result<()> {
     info!("Camera pipeline started: {}", camera_config.pipeline_str);
 
     tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            result.context("failed to listen for Ctrl+C")?;
+        changed = shutdown_signal_rx.changed() => {
+            if changed.is_err() || !*shutdown_signal_rx.borrow() {
+                return Err(anyhow!("Ctrl+C handler ended unexpectedly"));
+            }
             info!("Ctrl+C received, shutting down camera pipeline");
         }
         maybe_error = pipeline_error_rx.recv() => {
             match maybe_error {
                 Some(message) => {
                     error!("{message}");
+                    let _ = shutdown_tx.send(true);
                     shutdown_pipeline(pipeline, appsink, live_task, vlm_task).await?;
                     return Err(anyhow!("camera pipeline stopped due to a GStreamer error"));
                 }

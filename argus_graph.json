@@ -22,7 +22,7 @@
       "label": "desk",
       "category": "furniture",
       "rank": 4,
-      "crossed_out": true
+      "crossed_out": false
     },
     {
       "label": "backpack",

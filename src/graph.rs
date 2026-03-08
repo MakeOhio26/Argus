@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
@@ -44,6 +44,7 @@ struct WsEntitySnapshot {
     rank: u32,
     label: String,
     category: String,
+    crossed_out: bool,
 }
 
 #[derive(Serialize)]
@@ -83,15 +84,29 @@ impl SpatialGraph {
     pub fn upsert_entity(&mut self, label: &str, category: &str, rank: u32) {
         if let Some(&idx) = self.label_to_node.get(label) {
             self.graph[idx].rank = rank;
+            self.graph[idx].category = category.to_string();
         } else {
-            let idx = self.graph.add_node(EntityNode {
-                label: label.to_string(),
-                category: category.to_string(),
-                rank,
-                crossed_out: false,
-            });
-            self.label_to_node.insert(label.to_string(), idx);
+            self.insert_entity(label, category, rank, false);
         }
+    }
+
+    pub fn set_crossed_out(&mut self, label: &str, crossed_out: bool) -> Result<()> {
+        let idx = self.label_to_node.get(label).copied().ok_or_else(|| {
+            ArgusError::Graph(format!("unknown entity: {label}"))
+        })?;
+        self.graph[idx].crossed_out = crossed_out;
+        Ok(())
+    }
+
+    pub fn is_crossed_out(&self, label: &str) -> Option<bool> {
+        self.label_to_node
+            .get(label)
+            .copied()
+            .map(|idx| self.graph[idx].crossed_out)
+    }
+
+    pub fn labels(&self) -> HashSet<String> {
+        self.label_to_node.keys().cloned().collect()
     }
 
     /// Insert or update a directed edge: subject --[relation]--> object.
@@ -235,6 +250,7 @@ impl SpatialGraph {
                     rank: n.rank,
                     label: n.label.clone(),
                     category: n.category.clone(),
+                    crossed_out: n.crossed_out,
                 }
             })
             .collect();
@@ -263,7 +279,12 @@ impl SpatialGraph {
         let snapshot: GraphSnapshot = serde_json::from_str(&json)?;
         let mut graph = SpatialGraph::new();
         for entity in snapshot.entities {
-            graph.upsert_entity(&entity.label, &entity.category, entity.rank);
+            graph.insert_entity(
+                &entity.label,
+                &entity.category,
+                entity.rank,
+                entity.crossed_out,
+            );
         }
         for rel in snapshot.relations {
             if let Err(e) = graph.upsert_relation(&rel.subject, &rel.relation, &rel.object) {
@@ -271,6 +292,16 @@ impl SpatialGraph {
             }
         }
         Ok(graph)
+    }
+
+    fn insert_entity(&mut self, label: &str, category: &str, rank: u32, crossed_out: bool) {
+        let idx = self.graph.add_node(EntityNode {
+            label: label.to_string(),
+            category: category.to_string(),
+            rank,
+            crossed_out,
+        });
+        self.label_to_node.insert(label.to_string(), idx);
     }
 }
 
@@ -301,6 +332,16 @@ mod tests {
         assert_eq!(g.entity_count(), 1);
         let idx = g.label_to_node["cup"];
         assert_eq!(g.graph[idx].rank, 1);
+    }
+
+    #[test]
+    fn upsert_existing_entity_preserves_crossed_out_state() {
+        let mut g = SpatialGraph::new();
+        g.upsert_entity("cup", "object", 2);
+        g.set_crossed_out("cup", true).unwrap();
+        g.upsert_entity("cup", "object", 1);
+
+        assert_eq!(g.is_crossed_out("cup"), Some(true));
     }
 
     #[test]
@@ -341,5 +382,38 @@ mod tests {
         assert!(ctx.contains("cup"));
         assert!(ctx.contains("desk"));
         assert!(ctx.contains("--on-->"));
+    }
+
+    #[test]
+    fn to_json_includes_crossed_out() {
+        let mut g = SpatialGraph::new();
+        g.upsert_entity("cup", "object", 1);
+        g.set_crossed_out("cup", true).unwrap();
+
+        let json = g.to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["entities"][0]["crossed_out"], true);
+    }
+
+    #[test]
+    fn load_preserves_crossed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.json");
+
+        let json = r#"{
+  "entities": [
+    {
+      "label": "cup",
+      "category": "object",
+      "rank": 1,
+      "crossed_out": true
+    }
+  ],
+  "relations": []
+}"#;
+        std::fs::write(&path, json).unwrap();
+
+        let graph = SpatialGraph::load(&path).unwrap();
+        assert_eq!(graph.is_crossed_out("cup"), Some(true));
     }
 }
